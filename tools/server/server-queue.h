@@ -31,13 +31,17 @@ private:
     std::condition_variable condition_tasks;
 
     // used by yield_to_queue, all fields are guarded by mutex_tasks
+    // The end of a yield waits only for a task the worker is EXECUTING, never for an idle worker to wake up and
+    // acknowledge: that acknowledgement was two serial OS thread wake-ups (main -> worker -> main) at the end of every
+    // yield, three yields per speculative round, all on the decode's critical path.
     struct worker_t {
         std::thread             thread;
-        std::condition_variable cv;        // the worker sleeps on this until a yield starts
+        std::condition_variable cv;        // the worker sleeps on this until a yield has a task for it (never condition_tasks)
         std::exception_ptr      exception; // exception thrown while processing tasks, if any
         bool stop     = false;
-        bool busy     = false; // set by yield_to_queue(), cleared by the worker once it is done processing tasks
         bool yielding = false; // work() is still running on the start_loop() thread
+        bool in_task  = false; // the worker is running a task's callback (off the lock)
+        bool failed   = false; // a callback threw during this yield: serve no more tasks until the next yield
     };
     worker_t worker;
 
@@ -94,8 +98,8 @@ public:
      */
     void start_loop(int64_t idle_sleep_ms = -1);
 
-    // while waiting for work() to finish, run process_new_tasks on the worker thread
-    // returns once work() is done (may throw exceptions)
+    // while work() runs, serve new tasks on the worker thread (worker_loop)
+    // returns once work() is done and no worker task is in flight (may throw exceptions)
     // must be called from start_loop() thread (ideally inside callback_update_slots)
     // use case: return metrics while encode/decode is running
     // ref: https://github.com/ggml-org/llama.cpp/pull/27041
@@ -107,6 +111,18 @@ public:
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return queue_tasks_deferred.size();
+    }
+
+    // xyz-engine: a cancel of task id_target waits in the queue (the engine's rounds run inside the main loop and
+    // hand the slot back at the next round boundary, where the loop then serves the cancel)
+    bool has_cancel_for(int id_target) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (const auto & t : queue_tasks) {
+            if (t.type == SERVER_TASK_TYPE_CANCEL && t.id_target == id_target) {
+                return true;
+            }
+        }
+        return false;
     }
 
     //

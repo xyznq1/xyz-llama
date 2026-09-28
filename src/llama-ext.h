@@ -114,7 +114,51 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Run a draft model's feature fusion in the target graph (the xyz drafter's fc on the target's features). The getter
+// returns NULL when the current decode did not compute a complete fold, so callers can use their encoder path.
+LLAMA_API bool    llama_set_fc_fold(struct llama_context * ctx_tgt, const struct llama_model * model_dft,
+                                    const int32_t * layers, int32_t n_layers);
+LLAMA_API float * llama_get_fc_fold(struct llama_context * ctx_tgt);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+// ---- xyz-engine binding: the device tensors an external decode engine runs on ------------------------
+// the model's tensor by GGUF name (nullptr if absent)
+LLAMA_API const struct ggml_tensor * llama_model_tensor_ext(const struct llama_model * model, const char * name);
+// a context's memory, per model layer (nullptr where a layer has none): stream 0 K/V of its KV cache (for an iswa memory,
+// the SWA cache's) and the recurrent memory's conv state r, GDN state s, GDN pack pk, conv pack px
+struct llama_engine_mem {
+    int32_t n_layer;
+    int32_t kv_size;
+    const struct ggml_tensor * k[128];
+    const struct ggml_tensor * v[128];
+    int32_t rs_size;
+    int32_t rs_row;          // the recurrent row holding sequence 0 (its tail cell), -1 if none
+    int32_t pack_tokens;
+    const struct ggml_tensor * r[128];
+    const struct ggml_tensor * s[128];
+    const struct ggml_tensor * pk[128];
+    const struct ggml_tensor * px[128];
+};
+LLAMA_API bool llama_engine_mem_get(struct llama_context * ctx, struct llama_engine_mem * out);
+// sequence 0's cell positions in the KV cache (iswa: the SWA cache): out[i] = position of cell i, -1 empty; returns the
+// number of cells up to the last used one (<= n written)
+LLAMA_API int32_t llama_engine_kv_cells(struct llama_context * ctx, int32_t * out, int32_t n);
+// ---- xyz-engine hand-over: the memory metadata an external engine's rounds change, read at the takeover
+// and written back as the server's own path would have left it (the tensors are the context's own, bound by pointer)
+// sequence 0's full cell table (pos[i]: position of cell i, -1 empty; n >= the cache size) and head; returns the size
+LLAMA_API int32_t llama_engine_kv_table(struct llama_context * ctx, int32_t * pos, int32_t n, int32_t * head);
+// sequence 0's cells := pos[0..n) (-1 empty; cells past n empty), head := head (the drafter's SWA cache)
+LLAMA_API bool    llama_engine_kv_set_table(struct llama_context * ctx, const int32_t * pos, int32_t n, int32_t head);
+// the target's KV after the engine's verifies: cells [p0, p1) hold positions p0..p1-1 (cell = position, cells below
+// p0 already do), nothing of sequence 0 at or past p1; head := p1. false if a cell in the range holds anything else
+LLAMA_API bool    llama_engine_kv_commit(struct llama_context * ctx, int32_t p0, int32_t p1);
+// the target's recurrent cell of sequence 0 (rs_replay): its position and committed position -- pos - pos_commit rows of
+// the pack are pending, replayed by the next decode
+LLAMA_API bool    llama_engine_rs_get(struct llama_context * ctx, int32_t * pos, int32_t * pos_commit);
+LLAMA_API bool    llama_engine_rs_set(struct llama_context * ctx, int32_t pos, int32_t pos_commit);
+// a fresh sequence 0 gets the recurrent cell find_slot would give it (true: it has one)
+LLAMA_API bool    llama_engine_rs_claim(struct llama_context * ctx);
 
 //
 // model/context data extraction

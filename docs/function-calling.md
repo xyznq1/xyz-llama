@@ -69,7 +69,7 @@ Function calling is supported for all models (see https://github.com/ggml-org/ll
 | NousResearch-Hermes-3-Llama-3.1-70B-tool_use.jinja | Hermes 2 Pro |
 | NovaSky-AI-Sky-T1-32B-Flash.jinja | Hermes 2 Pro |
 | NovaSky-AI-Sky-T1-32B-Preview.jinja | Hermes 2 Pro |
-| OnlyCheeini-greesychat-turbo.jinja | Generic |
+| OnlyCheeini-greesychat-xyzkv.jinja | Generic |
 | Orenguteng-Llama-3.1-8B-Lexi-Uncensored-V2.jinja | Llama 3.x |
 | OrionStarAI-Orion-14B-Chat.jinja | Generic |
 | PowerInfer-SmallThinker-3B-Preview.jinja | Generic |

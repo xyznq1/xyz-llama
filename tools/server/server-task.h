@@ -613,9 +613,31 @@ struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        disk_init();
     }
 
     std::list<server_prompt_cache_state> states;
+
+    // An SSD tier under the RAM tier (PegaFlow's HBM -> RDMA -> SSD by hotness, single-box form:
+    // VRAM slot -> --cache-ram -> disk). A state the RAM tier evicts is written to XYZ_PC_DISK_DIR instead of being
+    // thrown away, load() matches disk entries by prefix exactly like RAM ones, and the folder is re-read at start, so
+    // a conversation that fell out of 3 GB of RAM (one 151k state is 1.7 GB) comes back in ~0.5 s from the SSD instead
+    // of a ~194 s re-prefill. The files hold the same bytes llama_state_seq_get/set_data_ext move for the RAM tier:
+    // the restore is exact. Off unless XYZ_PC_DISK_DIR is set; XYZ_PC_DISK_GB caps the folder (default 40).
+    struct disk_entry {
+        llama_tokens tokens;
+        std::string  path;
+        size_t       bytes = 0;
+    };
+    std::list<disk_entry> disk;
+    std::string disk_dir;
+    size_t      disk_limit = 0;
+    size_t      disk_bytes = 0;
+
+    void disk_init();
+    bool disk_spill(const server_prompt_cache_state & state);
+    void disk_drop_front();
+    void evict_front();     // the RAM tier's oldest entry -> the SSD tier (when enabled), then out of RAM
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

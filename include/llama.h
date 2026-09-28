@@ -156,6 +156,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PQ2_0         = 42, // except 1d tensors -- PrismML Ternary Bonsai 2, 2.125 bpw
+        LLAMA_FTYPE_MOSTLY_PTQ1_0        = 43, // except 1d tensors -- PrismML Ternary Bonsai 2, 1.75 bpw
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -362,6 +364,7 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        bool     rs_replay;             // snapshot-free rollback -- one recurrent row per seq, rejected drafts undone by replaying the accepted prefix inside the GDN kernel [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
@@ -570,6 +573,13 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+
+    // snapshot-free recurrent rollback (ggml_gated_delta_net_ext prefix replay)
+    LLAMA_API bool llama_rs_replay(const struct llama_context * ctx);
+    // arm the NEXT decode on seq_id: replay the first n_prev packed tokens of the previous decode
+    // before the batch and commit the state after them; n_prev < 0 = ordinary commit-all decode.
+    // Consumed by the next decode.
+    LLAMA_API void llama_rs_set_prefix(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_prev);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
@@ -1040,6 +1050,37 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Logits prefilter. k > 0: a decode that fits one ubatch also emits each output row's top-k and
+    // copies only those (id, logit) pairs to the host; the full rows stay on the device and llama_get_logits_ith()
+    // fetches one on demand, so every existing reader keeps working. llama_get_logits_topk_ith() returns k and points at
+    // the row's pairs (ids in no order), or 0 when the last decode was not prefiltered.
+    LLAMA_API void    llama_set_logits_topk    (struct llama_context * ctx, int32_t k);
+    LLAMA_API int32_t llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, const int32_t ** ids, const float ** vals);
+
+    // DEVICE DRAFT CHAIN, for an XYZ/xyz2 draft context with compact logits: each draw runs on
+    // the GPU (GGML_OP_DRAFT_SAMPLE) and the next step reads the drawn token's embedding row and the feedback hidden
+    // straight from device memory -- the host issues a whole draft without waiting on any step.
+    //   init: col_ids = the head's column -> token id map; n_steps = draws per draft; top_k/top_p = the draft chain's
+    //   set:  before each decode -- mode 0 off, 1 seed (host inputs, GPU draw), 2 step (inputs from the last draw);
+    //         step = the record row of this draw; key = llama_sampler_coupled_key of the position it draws
+    //   get:  synchronize, then copy the first n records (GGML_DRAFT_SAMPLE_OUT int32 each) to out
+    LLAMA_API bool llama_draft_chain_init(struct llama_context * ctx, const int32_t * col_ids, int32_t n_col,
+                                          int32_t n_steps, int32_t top_k, float top_p);
+    LLAMA_API void llama_draft_chain_set (struct llama_context * ctx, int32_t mode, int32_t step, uint64_t key);
+    LLAMA_API bool llama_draft_chain_get (struct llama_context * ctx, int32_t * out, int32_t n);
+
+    // arm ctx_tgt's NEXT decode as the verify of a device draft chain of ctx_dft that is
+    // still in flight. That decode must be one ubatch of 1 + n_draft token positions: row 0 is looked up from its token as
+    // usual, rows 1..n_draft are the draws' embedding rows gathered on the device from the chain's records (the batch's
+    // tokens there are placeholders), and the decode waits on the device for the chain, not on the host. Returns false
+    // (nothing armed) when the pairing cannot work: no chain, another embedding table, LoRA, or different devices.
+    LLAMA_API bool llama_verify_chain_arm(struct llama_context * ctx_tgt, struct llama_context * ctx_dft, int32_t n_draft);
+
+    // Queue the download of the chain's first n records on the chain's own stream, into pinned memory, right behind the
+    // last draw; the next llama_draft_chain_get(ctx, n) then waits for that copy alone (not for other contexts' work).
+    // Returns false (nothing queued; llama_draft_chain_get downloads as before) when there is no pinned buffer.
+    LLAMA_API bool llama_draft_chain_fetch(struct llama_context * ctx, int32_t n);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
@@ -1368,6 +1409,22 @@ extern "C" {
 
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
+
+    // Coupled (shared-noise) selection for speculative decoding.
+    //
+    // When armed, the dist sampler selects argmax(logit + g) where g is a Gumbel(0,1) draw derived
+    // from `key` and the candidate's TOKEN ID, instead of drawing from its own RNG. By the
+    // Gumbel-max trick this is still an exact sample from the sampler's distribution, so output
+    // quality is unchanged -- but a drafter and a target armed with the SAME key now agree with
+    // probability 1 - TV(p_draft, p_target) rather than the much smaller independent-draw collision
+    // rate, which is what makes speculative decoding survive temperature > 0.
+    //
+    // Arm it per position; use llama_sampler_coupled_key to build the key.
+    LLAMA_API void     llama_sampler_dist_set_coupled(struct llama_sampler * smpl, bool enabled, uint64_t key);
+    LLAMA_API uint64_t llama_sampler_coupled_key     (uint32_t seed, int32_t seq_id, int32_t pos);
+    // xyz-engine: n draws of a dist sampler's own rng, as its one-candidate branch takes them (rows an external engine
+    // decided); a no-op for any other sampler
+    LLAMA_API void     llama_sampler_dist_discard    (struct llama_sampler * smpl, int32_t n);
 
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop

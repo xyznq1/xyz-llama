@@ -610,7 +610,7 @@ class MODEL_ARCH(IntEnum):
     RND1             = auto()
     PANGU_EMBED      = auto()
     MISTRAL3         = auto()
-    EAGLE3           = auto()
+    XYZ           = auto()
     DFLASH           = auto()
     MISTRAL4         = auto()
     PADDLEOCR        = auto()
@@ -1179,7 +1179,7 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM            = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
-    # eagle3
+    # xyz
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
     # dspark
@@ -1363,7 +1363,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.RND1:             "rnd1",
     MODEL_ARCH.PANGU_EMBED:      "pangu-embedded",
     MODEL_ARCH.MISTRAL3:         "mistral3",
-    MODEL_ARCH.EAGLE3:           "eagle3",
+    MODEL_ARCH.XYZ:           "xyz",
     MODEL_ARCH.DFLASH:           "dflash",
     MODEL_ARCH.MISTRAL4:         "mistral4",
     MODEL_ARCH.PADDLEOCR:        "paddleocr",
@@ -5019,7 +5019,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
     ],
-    MODEL_ARCH.EAGLE3: [
+    MODEL_ARCH.XYZ: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,
@@ -5523,6 +5523,7 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    PTQ1_0  = 143  # PrismML ternary, group 128: 1.75 bpw (fork type)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5716,6 +5717,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.PTQ1_0:  (128, 2 + 2 + 24),   # d, qh, qs (block_ptq1_0): 1.75 bpw
 }
 
 

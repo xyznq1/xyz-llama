@@ -14,6 +14,8 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+    bool     rs_replay;       // snapshot-free rollback: one recurrent row per seq + prefix replay in the GDN kernel
+    uint32_t rs_pack_tokens;  // rs_replay: tokens per cell in the pack rows (env LLAMA_RS_PACK_TOKENS, default 16; 0 when off)
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation

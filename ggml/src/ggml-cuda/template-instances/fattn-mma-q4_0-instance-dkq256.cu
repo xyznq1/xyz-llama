@@ -1,0 +1,7 @@
+// Native q4_0 MMA flash-attention instances for the drafter.
+
+#include "../fattn-mma-f16.cuh"
+
+DECL_FATTN_MMA_XYZKV_CASE(256, 256, 2, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+DECL_FATTN_MMA_XYZKV_CASE(256, 256, 4, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+DECL_FATTN_MMA_XYZKV_CASE(256, 256, 8, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);

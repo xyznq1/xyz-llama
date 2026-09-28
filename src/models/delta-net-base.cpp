@@ -452,7 +452,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         ggml_tensor *        qkv_mixed,
         int64_t              conv_kernel_size,
         int64_t              conv_channels,
-        int                  il) {
+        int                  il,
+        int64_t *            n_prev_out) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head  = mctx_cur->get_head();
@@ -460,23 +461,90 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
-    cb(conv_states, "conv_states", il);
+    ggml_tensor * conv_states_flat = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    cb(conv_states_flat, "conv_states", il);
 
-    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    // snapshot layout [W, C] (time-fastest, upstream); replay-enabled contexts store [C, W] (see below)
+    ggml_tensor * conv_states = ggml_reshape_3d(ctx0, conv_states_flat, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    ggml_tensor * qkv_mixed_cf = qkv_mixed; // [C, n_seq_tokens, n_seqs] as projected (channel-fastest)
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+    // snapshot-free rollback (audit §8c): the conv window is committed AFTER the replayed prefix
+    // inputs, and this batch's inputs are parked in the cell's pack row for next round
+    // rs_replay (fixed-shape): the conv window is stored channel-fastest [C, W] so time steps are rows.
+    // The window preceding this batch is picked at RUNTIME with ggml_get_rows(inp->conv_idx) from
+    // [state(W) ++ pack(P)] -- no shape depends on how many tokens each sequence replays.
+    //   mode 1 (armed): window = rows after the replayed prefix; commit it; park this batch as the pack
+    //   mode 2 (unarmed, pending): window as above; commit the last W inputs of this batch
+    //   mode 0: plain K = 1 path in the replay layout
+    const bool    rs_replay = cparams.n_rs_seq == 0 && mctx_cur->get_pack_tokens() > 0;
+    const int32_t rs_mode   = rs_replay ? mctx_cur->get_rs_mode() : 0;
+    if (n_prev_out) {
+        *n_prev_out = 0; // the conv output carries exactly this batch's tokens in every mode
+    }
+    ggml_tensor * conv_input = nullptr;
+    ggml_tensor * conv_eff   = nullptr; // rs_replay: the window that precedes this batch, [C, W, n_seqs]
+    if (rs_replay) {
+        const int64_t W = conv_kernel_size - 1;
+        GGML_ASSERT(mctx_cur->get_conv_channels() == conv_channels && mctx_cur->get_conv_window() == W);
+        ggml_tensor * conv_states_r = ggml_reshape_3d(ctx0, conv_states_flat, conv_channels, W, n_seqs);
+        conv_eff = conv_states_r;
+        if (rs_mode != 0) {
+            GGML_ASSERT(inp->conv_idx != nullptr);
+            const int64_t pack_tokens = mctx_cur->get_pack_tokens();
+            ggml_tensor * px_all = mctx_cur->get_px_l(il);
+            ggml_tensor * px_cur = build_rs(inp, px_all, (int32_t) px_all->ne[0], n_seqs);            // [P*C, n_seqs]
+            ggml_tensor * x_prev = ggml_reshape_3d(ctx0, px_cur, conv_channels, pack_tokens, n_seqs);   // [C, P, n_seqs], token 0 first
+            ggml_tensor * window = ggml_concat(ctx0, conv_states_r, x_prev, 1);                         // [C, W + P, n_seqs]
+            conv_eff = ggml_get_rows(ctx0, window, inp->conv_idx);                                      // [C, W, n_seqs]: rows p .. p + W - 1
+            cb(conv_eff, "conv_window_replayed", il);
+            if (rs_mode == 1) {
+                GGML_ASSERT(ubatch.n_seq_tokens <= pack_tokens);
+                // conv_eff reads px_all, while x_dst below overwrites px_all. Materialize the old window first.
+                // (scheduled the other way round, every round with an accepted prefix would read this batch's inputs
+                // as the previous round's; with the gather first the replay is byte-identical to snapshots)
+                ggml_build_forward_expand(gf, conv_eff);
+                // park this batch's inputs (channel-fastest, token 0 first) as next round's pack
+                ggml_tensor * x_dst = ggml_view_3d(ctx0, px_all, conv_channels, ubatch.n_seq_tokens, n_seqs,
+                        ggml_row_size(px_all->type, conv_channels), px_all->nb[1], (size_t) kv_head * px_all->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_mixed_cf, x_dst));
+            }
+        }
+        // the conv reads time-fastest [W + n, C]; concatenating the two transposed views writes it contiguous
+        conv_input = ggml_concat(ctx0, ggml_transpose(ctx0, conv_eff), qkv_mixed, 0);
+    } else {
+        conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+    }
     cb(conv_input, "conv_input", il);
 
     const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (rs_replay) {
+        // committed window in the replay layout [C, W]: pack mode = the window right after the replayed
+        // prefix (conv_eff, already [C, W]); otherwise the last W inputs of this batch, transposed into it
+        ggml_tensor * conv_state_last = conv_eff;
+        if (rs_mode != 1) {
+            conv_state_last = ggml_transpose(ctx0,
+                ggml_view_3d(ctx0, conv_input,
+                        conv_kernel_size - 1, conv_channels, n_seqs,
+                        conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, conv_input->ne[0] - (conv_kernel_size - 1))));
+        }
+        cb(conv_state_last, "conv_state_last", il);
+
+        ggml_tensor * conv_state_update =
+            ggml_view_2d(ctx0, conv_states_all,
+                    row_count, n_seqs, conv_states_all->nb[1],
+                    (size_t) kv_head * row_size);
+        cb(conv_state_update, "conv_state_update", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+    } else if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -501,7 +569,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
+        // only the snapshot slots reachable by a rollback inside this batch are
+        // useful: rollback <= n_seq_tokens - 1, so slots beyond the batch repeat
+        // the pre-batch state and would only waste kernel launches per round
+        const int64_t t_min = std::max<int64_t>(1, K - ubatch.n_seq_tokens + 1);
+
+        for (int64_t t = t_min; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
@@ -544,6 +617,60 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
+
+    // snapshot-free rollback (audit §8c): replay the committed prefix inside the kernel, commit the
+    // state after it, publish this batch's inputs as next round's prefix. One row per sequence.
+    const int32_t rs_mode  = (!keep && mctx_cur->get_pack_tokens() > 0) ? mctx_cur->get_rs_mode() : 0;
+    const bool    gdn_pack = rs_mode == 1;
+    if (rs_mode != 0) {
+        const int64_t S_k = q->ne[0];
+        const int64_t H_k = q->ne[1];
+        const bool    kda = g->ne[0] == S_v;
+        const int64_t D   = S_v * S_v * H_v;
+        const int64_t pack_row    = ggml_gated_delta_net_pack_row(S_k, H_k, S_v, H_v, kda);
+        const int64_t pack_tokens = mctx_cur->get_pack_tokens();
+        GGML_ASSERT(!gdn_pack || n_seq_tokens <= pack_tokens);
+        GGML_ASSERT(inp->prefix_n != nullptr);
+        GGML_ASSERT(pack_row <= mctx_cur->get_pack_row_gdn()); // the memory sizes the row for the worst case (H_k = H_v)
+
+        ggml_tensor * pk_all = mctx_cur->get_pk_l(il);
+        // gather the whole row as the memory sized it (worst-case q/k heads); view only what we pack
+        ggml_tensor * pk     = build_rs(inp, pk_all, (int32_t) pk_all->ne[0], n_seqs);
+        // fixed-shape prefix: the view spans the whole pack row; each sequence replays inp->prefix_n[s] rows
+        ggml_tensor * prefix = ggml_view_3d(ctx0, pk, pack_row, pack_tokens, n_seqs, ggml_row_size(pk->type, pack_row), pk->nb[1], 0);
+        // armed: commit after the prefix and pack this batch; unarmed: replay, then commit through the batch
+        ggml_tensor * gdn_out = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, prefix, inp->prefix_n, /*K=*/ 1,
+                gdn_pack ? (GGML_GDN_COMMIT_AFTER_PREFIX | GGML_GDN_WRITE_PACK) : 0);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+        const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out, S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens), 0);
+        cb(output, "attn_output", il);
+        // committed state (slot 0) -> the cell row, exactly like the K = 1 path
+        ggml_tensor * new_state = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+            ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, attn_score_elems));
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        if (gdn_pack) {
+            // this batch's packed inputs -> the cell's pack row (token 0 first)
+            const int64_t pack_floats = pack_row * n_seq_tokens;
+            ggml_tensor * pack_src = ggml_view_2d(ctx0, gdn_out, pack_floats, n_seqs,
+                ggml_row_size(gdn_out->type, pack_floats),
+                ggml_row_size(gdn_out->type, attn_score_elems + D * n_seqs));
+            ggml_tensor * pack_dst = ggml_view_2d(ctx0, pk_all, pack_floats, n_seqs, pk_all->nb[1],
+                (size_t) kv_head * pk_all->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, pack_src, pack_dst));
+        }
+        return output;
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);

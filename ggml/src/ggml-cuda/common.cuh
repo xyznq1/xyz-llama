@@ -452,6 +452,11 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 }
 
+static __device__ __forceinline__ half2 ptq1_perm_ds(const float d, const float sum_x, const int sum_q) {
+    GGML_UNUSED(sum_x);
+    return __halves2half2(__float2half(d), __short_as_half((short) -sum_q));
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #pragma unroll
@@ -985,6 +990,35 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
     static constexpr int qi = QI2_0;
 };
 
+// PrismML PQ2_0: q2_0's codec at a 128-wide scale group. qi = QK/32 = 4, so MMVQ walks FOUR 32-wide
+// q8_1 chunks per block instead of q2_0's two -- which is the entire behavioural difference, and it is
+// expressed here in the traits rather than in the kernel body.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PQ2_0> {
+    static constexpr int qk = QK_PQ2_0;
+    static constexpr int qr = QR_PQ2_0;
+    static constexpr int qi = QI_PQ2_0;
+};
+
+// PTQ1_0: qi = 4 and VDR = 4, i.e. ONE vec_dot call consumes the entire 128-weight block. That is not
+// a tuning choice -- the trits are interleaved across the byte array, so a partial walk would have to
+// re-derive its position in the base-3 chain. Taking the whole block keeps the byte walk uniform.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
+    static constexpr int qk = QK_PTQ1_0;
+    static constexpr int qr = QR_PTQ1_0;
+    static constexpr int qi = QI_PTQ1_0;
+};
+
+// Complete groups of 16 PTQ1_0 rows are stored k-block-major, then row-major within each group.
+// A final partial group remains row-major.
+
+// block index of (row, kb) inside one PTQ1_0 matrix of nrows rows with stride_row blocks per row
+static __host__ __device__ __forceinline__ int64_t ptq1_ilv_block(
+        const int64_t row, const int64_t kb, const int64_t stride_row, const int64_t nrows) {
+    return row < (nrows & ~(int64_t) 15) ? (row & ~(int64_t) 15)*stride_row + kb*16 + (row & 15) : row*stride_row + kb;
+}
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;
@@ -1237,9 +1271,23 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        for (auto & h : head_instances) {
+            if (h != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(h));
+            }
+        }
+        for (auto & h : head_graphs) {
+            if (h != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(h));
+            }
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // A large graph is captured as several CUDA graphs launched in order.
+    std::vector<cudaGraph_t>     head_graphs;
+    std::vector<cudaGraphExec_t> head_instances;
+    int                          n_head = 0;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1417,6 +1465,46 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // A GATED_DELTA_NET node whose state GET_ROWS was fused stores {the recurrent
+    // cache table, the row-index vector}; set at the GET_ROWS node, consumed by the GDN launch in the same evaluation.
+    std::unordered_map<const ggml_tensor *, std::pair<const float *, const int32_t *>> gdn_state_src;
+
+    // The replay prefix stores {the pack table
+    // cache_pk_l, the row-index vector, the table's row length in floats}.
+    struct gdn_prefix_direct { const float * table; const int32_t * idx; int64_t row_floats; };
+    std::unordered_map<const ggml_tensor *, gdn_prefix_direct> gdn_prefix_src;
+
+    // Signed-Hadamard kernels also write each PTQ1_0 activation in the ptq1_perm q8_1 layout.
+    // The PTQ1
+    // matmul uses the twin instead of launching its own quantize. A twin is valid while nothing has written over its
+    // f32 source (ggml_cuda_try_fuse invalidates on overlap); decisions are made at capture, so graphs replay them.
+    struct ptq1_q8_twin {
+        const void * f32   = nullptr;   // the activation the twin mirrors (null = empty)
+        size_t       bytes = 0;         // its size
+        int64_t      ne0   = 0;         // row length
+        int64_t      nrows = 0;
+        void *       q8    = nullptr;   // persistent device buffer
+    };
+    static constexpr int    PTQ1_Q8_TWINS      = 2;
+    static constexpr size_t PTQ1_Q8_TWIN_BYTES = 1u << 20;   // 16 rows x 32768 values in q8_1
+    ptq1_q8_twin ptq1_q8_twins[PTQ1_Q8_TWINS];
+    int          ptq1_q8_twin_next  = 0;
+    int          ptq1_q8_twin_fresh = -1;   // the slot the current ggml_cuda_try_fuse call filled, spared by its invalidation
+
+    // Queue small pinned uploads and issue them together on the next backend operation.
+    static constexpr int UP_MAX = 24;
+    struct up_batch {
+        const char * src[UP_MAX];
+        char *       dst[UP_MAX];
+        int64_t      n[UP_MAX];
+    };
+    up_batch up_pend = {};
+    int      n_up_pend  = 0;
+    int64_t  up_pend_max = 0;   // the largest queued upload (sizes the grid)
+
+    // The next graph compute waits on this event.
+    cudaEvent_t graph_wait_ev = nullptr;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1486,13 +1574,19 @@ struct ggml_backend_cuda_context {
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
+        if (stream == 0) {
+            if (streams[device][0] == nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][0], cudaStreamNonBlocking));
+            }
+            return streams[device][0];
+        }
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
         }
         return streams[device][stream];
     }
-
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
@@ -1511,6 +1605,9 @@ struct ggml_backend_cuda_context {
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
+        }
+        if (curr_stream_no == 0) {
+            CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
         }
         return cublas_handles[device][curr_stream_no];
     }
@@ -1549,6 +1646,15 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // Sibling matmuls share one launch: rows >= dst_hi_row0 of the
+    // merged [A; B] matrix go to dst_hi (B's output, column stride dst_hi_stride_col) instead of dst.
+    float * dst_hi = nullptr;
+    int dst_hi_row0 = 0;
+    int dst_hi_stride_col = 0;
+    // Rows for a third sibling [A; B; C] go to dst_hi2.
+    float * dst_hi2 = nullptr;
+    int dst_hi2_row0 = 0;
+    int dst_hi2_stride_col = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

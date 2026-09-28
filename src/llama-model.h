@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -322,6 +323,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_up       = nullptr; // w3
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
+    // xyz 3+1 hybrid: the pruned FFN the draft chain's LAST step uses (blk.*.ffn_*.last, optional)
+    struct ggml_tensor * ffn_norm_last = nullptr;
+    struct ggml_tensor * ffn_gate_last = nullptr;
+    struct ggml_tensor * ffn_up_last   = nullptr;
+    struct ggml_tensor * ffn_down_last = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
 
     // ff MoE
@@ -666,8 +672,11 @@ struct llama_model {
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
-    // eagle3 / dflash feature fusion layer
+    // xyz / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;
+    // XYZ/xyz2 v2: a student narrower than the target projects back up to the target's width before the borrowed
+    // head (d -> n_embd_tgt). Absent for a same-width drafter like the heal.
+    struct ggml_tensor * xyz_up = nullptr;
     struct ggml_tensor * fc_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
@@ -682,10 +691,51 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
 
-    // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
+    // unified vector to store target-model extracted layer ids in xyz, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_layer> layers;
+
+    // ---- rotated-basis weights (PrismML Ternary Bonsai 2) ----------------------------------------
+    // The GGUF declares prism.hadamard.*: every listed weight is stored as W * diag(s) * H, with H a
+    // normalized Sylvester-Walsh-Hadamard over the INPUT dimension in `had_block` (1024) wide blocks
+    // and s an explicit +/-1 vector. Both are orthogonal, so inference does NOT un-rotate the weights
+    // -- it rotates the ACTIVATION the same way and multiplies as usual:
+    //     y = W x = (W_stored) * (H * diag(s) * x)
+    // Un-rotating at load would defeat the point: the rotation is what makes 1.75 bpw survivable, and
+    // the un-rotated weights would need f16 to store.
+    //
+    // Discovered the hard way -- both quant types decoded perfectly and the model still emitted fluent
+    // nonsense, on GPU and CPU alike, because a wrong BASIS is not a wrong byte.
+    bool                            had_enabled = false;
+    // token_embd is listed in prism.hadamard.inverse_weight_names and is STORED ROTATED: measured by
+    // dequantising it and un-rotating in numpy, kurtosis goes 1.60 -> 88.45, i.e. from near-Gaussian
+    // (what a Hadamard rotation makes everything look like) to the heavy tails a real embedding table
+    // has. So ggml_get_rows already yields the rotated basis and the residual stream has to be brought
+    // back before the per-weight rotation runs, or the first layer is rotated twice.
+    bool                            had_embd_rotated = false;
+    uint32_t                        had_block   = 0;   // 1024
+    std::set<std::string>           had_weights;       // the 401 tensors stored rotated
+    std::map<uint32_t, std::vector<float>> had_signs;  // input width -> its +/-1 vector
+    std::map<uint32_t, struct ggml_tensor *> had_sign_t; // input width -> that vector on the device
+    // [had_block, had_block] src0 of the rotation matmul: a MUL_MAT carrying
+    // GGML_HINT_SRC0_IS_HADAMARD is replaced by the backend with an in-place FWHT of src1, and the
+    // hint has no third source, so this tensor is how the transform width reaches the kernel.
+    //
+    // It holds the REAL normalized Hadamard matrix rather than being left uninitialised. The fast
+    // paths never read it, but ggml-cpu falls through to an ordinary matmul against src0 when
+    // params->use_ref is set -- with garbage here that path would return a plausible wrong answer
+    // instead of failing, which is the defect class that costs the most to find. 4 MiB, against the
+    // 4,288 MiB the format frees.
+    struct ggml_tensor *            had_rot = nullptr;
+    // The rotated tensors again, keyed by POINTER -- the only key a graph can trust. Names are not
+    // unique across the models in one process: a drafter borrows its target's token_embd and output
+    // (dflash, dspark, xyz, gemma4-assistant), and both models own an "output.weight". Looking the
+    // name up in the GRAPH's model therefore missed every borrowed tensor, so the drafter multiplied the
+    // target's rotated head by an unrotated activation and embedded tokens with rotated rows. Measured
+    // without it a drafter reads its target's rotated tensors as ordinary ones. Filled once tensors exist.
+    std::unordered_set<const struct ggml_tensor *> had_tensors;
+    const struct ggml_tensor *                     had_embd = nullptr; // the stored-rotated embedding table
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

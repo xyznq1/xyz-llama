@@ -30,6 +30,14 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
+void quantize_row_pq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_pq2_0_ref(x, y, k);
+}
+
+void quantize_row_ptq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_ptq1_0_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -217,6 +225,127 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
         }
 
         sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// PrismML PQ2_0 CPU reference. Deliberately NOT routed through the arch-fallback machinery (no
+// _generic suffix, no entry in arch-fallback.h): this exists to be the thing test-backend-ops
+// compares the CUDA kernel AGAINST, so a plain, obviously-correct scalar loop is worth more than a
+// vectorised one. The only structural difference from q2_0 above is the block ratio -- 128 weights
+// span FOUR q8_0 blocks instead of two.
+void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_PQ2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_pq2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        float sumi = 0.0f;
+
+        // group 128: one PQ2_0 block (128 weights) maps to four Q8_0 blocks (4 * 32 = 128)
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            int sumi_block = 0;
+
+            const uint8_t * GGML_RESTRICT qs = &x[i].qs[k * 8];
+            const int8_t  * GGML_RESTRICT qy = yb->qs;
+
+            for (int b = 0; b < 8; ++b) {
+                const uint8_t byte = qs[b];
+                // Extract 4 two-bit values, map {0,1,2,3} -> {-1,0,1,2}
+                sumi_block += ((int)((byte >> 0) & 3) - 1) * qy[b*4 + 0];
+                sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
+                sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
+                sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
+            }
+
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// PrismML PTQ1_0 CPU reference: the thing test-backend-ops grades the CUDA trit kernel against.
+//
+// Deliberately a plain scalar loop, and deliberately written from the ELEMENT INDEX rather than by
+// walking output positions, because the trit layout is interleaved and that is the easy place to get
+// it silently wrong. The index arithmetic mirrors their CUDA kernel exactly:
+//     bytes  0..15 : e = t*16 + m          (5 trits x 16 bytes =  80 values)
+//     bytes 16..23 : e = 80 + t*8 + m      (5 trits x  8 bytes =  40 values)
+//     qh[0..1]     : e = 120 + t*2 + h     (4 trits x  2 bytes =   8 values)
+// 128 weights span FOUR q8_0 blocks, so element e lives in block e/32 at offset e%32.
+void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_PTQ1_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ptq1_0 * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        int sumi[4] = { 0, 0, 0, 0 };
+
+        for (int m = 0; m < 16; ++m) {
+            uint32_t v = x[i].qs[m];
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w = v * 3;
+                const int q = (int) (w >> 8) - 1;   // {0,1,2} -> {-1,0,+1}
+                v = w & 0xFF;
+                const int e = t * 16 + m;
+                sumi[e >> 5] += q * (int) y[i*4 + (e >> 5)].qs[e & 31];
+            }
+        }
+        for (int m = 0; m < 8; ++m) {
+            uint32_t v = x[i].qs[16 + m];
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w = v * 3;
+                const int q = (int) (w >> 8) - 1;
+                v = w & 0xFF;
+                const int e = 80 + t * 8 + m;
+                sumi[e >> 5] += q * (int) y[i*4 + (e >> 5)].qs[e & 31];
+            }
+        }
+        for (int h = 0; h < 2; ++h) {
+            uint32_t v = x[i].qh[h];
+            for (int t = 0; t < 4; ++t) {
+                const uint32_t w = v * 3;
+                const int q = (int) (w >> 8) - 1;
+                v = w & 0xFF;
+                const int e = 120 + t * 2 + h;
+                sumi[e >> 5] += q * (int) y[i*4 + (e >> 5)].qs[e & 31];
+            }
+        }
+
+        for (int k = 0; k < 4; ++k) {
+            sumf += d0 * GGML_CPU_FP16_TO_FP32(y[i*4 + k].d) * (float) sumi[k];
+        }
     }
 
     *s = sumf;

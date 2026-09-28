@@ -248,6 +248,11 @@ if (LLAMA_BUILD_APP)
     add_subdirectory(app)
 endif()
 
+# xyz-engine: the speculative decode rounds as a CUDA DLL the server loads when XYZ_ENGINE=1 (Windows + CUDA)
+if (WIN32 AND GGML_CUDA AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/xyz-engine/CMakeLists.txt)
+    add_subdirectory(xyz-engine)
+endif()
+
 # Standalone libmtmd build without pulling in the rest of the tools/ tree.
 # Useful when packaging just the mtmd library for language bindings (e.g. an
 # Apple XCFramework, or a WASM build). When the full tools build is enabled,

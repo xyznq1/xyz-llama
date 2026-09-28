@@ -611,7 +611,8 @@ static void test_reallocation() {
         bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
         GGML_ASSERT(result);
         check_all_allocated(graph);
-        GGML_ASSERT(backend.context->allocated_total() == 40);
+        // the buffer grew: each of its two 20-byte chunks takes max(size/16, 4 MiB) of headroom (ggml_vbuffer_regrow_pad)
+        GGML_ASSERT(backend.context->allocated_total() == 2*(20 + ((size_t) 4 << 20)));
     }
 }
 

@@ -35,6 +35,7 @@ public:
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   rs_pack_tokens,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -60,9 +61,12 @@ public:
 
     void clear(bool data) override;
 
+    void pos_dev_invalidate() override;   // forwards to the attention cache (device KQ mask)
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
+    void rs_set_prefix(llama_seq_id seq_id, int32_t n_prev) override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
@@ -118,6 +122,11 @@ public:
     bool apply() override;
 
     llama_memory_status  get_status() const override;
+
+    // xyzkv: delegate to the KV cache context
+    ggml_tensor * get_xyzkv_rot_forward() const override;
+    ggml_tensor * get_xyzkv_rot_inverse() const override;
+    ggml_tensor * get_xyzkv_innerq_scale_inv() const override;
     const llama_ubatch & get_ubatch() const override;
 
     //

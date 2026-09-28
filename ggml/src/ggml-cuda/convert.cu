@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "xyzkv-quant.cuh"
 
 #include <cstdint>
 
@@ -24,7 +25,9 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
 
             const int64_t ibx0 = i03*s03 + i02*s02 + i01*s01;
 
-            const int64_t ib = ibx0 + i00/qk; // block index
+            // block index (PTQ1_0: ILV16 matrices, common.cuh)
+            const int64_t ib = dequantize_kernel == dequantize_ptq1_0 ? i03*s03 + i02*s02 + ptq1_ilv_block(i01, i00/qk, s01, ne01)
+                                                                      : ibx0 + i00/qk;
             const int64_t iqs = (i00%qk)/qr; // quant index
             const int64_t iybs = i00 - i00%qk; // y block start index
             const int64_t y_offset = qr == 1 ? 1 : qk/2;
@@ -107,6 +110,98 @@ static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t
         y[l+ 0] = ggml_cuda_cast<dst_t>(d * (q[l] & 0xF) + dm);
         y[l+16] = ggml_cuda_cast<dst_t>(d * (q[l] >>  4) + dm);
     }
+}
+
+// Vectorized q4_0 to f16 conversion.
+static __global__ void dequantize_block_q4_0_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t nb32) {
+    const int64_t i  = blockIdx.x;
+    const int64_t tid = threadIdx.x; // assume 32 threads
+    const int64_t il = tid/8;        // 0..3
+    const int64_t ir = tid%8;        // 0..7
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+
+    half * yb = y + 256*i + 32*ir + 4*il;
+    const block_q4_0 * x = (const block_q4_0 *)vx + ib;
+    const float d  = __half2float(x->d);
+    const float dm = -8.0f*d;
+    const uint8_t * q = x->qs + 4*il;
+
+    ((half2 *)(yb +  0))[0] = __floats2half2_rn(d*(q[0] & 0xF) + dm, d*(q[1] & 0xF) + dm);
+    ((half2 *)(yb +  0))[1] = __floats2half2_rn(d*(q[2] & 0xF) + dm, d*(q[3] & 0xF) + dm);
+    ((half2 *)(yb + 16))[0] = __floats2half2_rn(d*(q[0] >>  4) + dm, d*(q[1] >>  4) + dm);
+    ((half2 *)(yb + 16))[1] = __floats2half2_rn(d*(q[2] >>  4) + dm, d*(q[3] >>  4) + dm);
+}
+
+// Vectorized q4_1 and q5 to f16 conversion.
+static __global__ void dequantize_block_q4_1_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t nb32) {
+    const int64_t i = blockIdx.x;
+    const int64_t tid = threadIdx.x;
+    const int64_t il = tid/8, ir = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) return;
+    half * yb = y + 256*i + 32*ir + 4*il;
+    const block_q4_1 * x = (const block_q4_1 *)vx + ib;
+    const float2 dm = __half22float2(x->dm);
+    const uint8_t * q = x->qs + 4*il;
+    ((half2 *)(yb +  0))[0] = __floats2half2_rn(dm.x*(q[0] & 0xF) + dm.y, dm.x*(q[1] & 0xF) + dm.y);
+    ((half2 *)(yb +  0))[1] = __floats2half2_rn(dm.x*(q[2] & 0xF) + dm.y, dm.x*(q[3] & 0xF) + dm.y);
+    ((half2 *)(yb + 16))[0] = __floats2half2_rn(dm.x*(q[0] >>  4) + dm.y, dm.x*(q[1] >>  4) + dm.y);
+    ((half2 *)(yb + 16))[1] = __floats2half2_rn(dm.x*(q[2] >>  4) + dm.y, dm.x*(q[3] >>  4) + dm.y);
+}
+
+static __global__ void dequantize_block_q5_0_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t nb32) {
+    const int64_t i = blockIdx.x;
+    const int64_t tid = threadIdx.x;
+    const int64_t il = tid/8, ir = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) return;
+    half * yb = y + 256*i + 32*ir + 4*il;
+    const block_q5_0 * x = (const block_q5_0 *)vx + ib;
+    const float d = __half2float(x->d);
+    uint32_t qh; memcpy(&qh, x->qh, sizeof(qh));
+    const uint8_t * q = x->qs + 4*il;
+    float lo[4], hi[4];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int p = 4*il + l;
+        const int xh_l = ((qh >> p)        << 4) & 0x10;
+        const int xh_h = ((qh >> (p + 12))     ) & 0x10;
+        lo[l] = (float)(((q[l] & 0xF) | xh_l) - 16) * d;
+        hi[l] = (float)(((q[l] >>  4) | xh_h) - 16) * d;
+    }
+    ((half2 *)(yb +  0))[0] = __floats2half2_rn(lo[0], lo[1]);
+    ((half2 *)(yb +  0))[1] = __floats2half2_rn(lo[2], lo[3]);
+    ((half2 *)(yb + 16))[0] = __floats2half2_rn(hi[0], hi[1]);
+    ((half2 *)(yb + 16))[1] = __floats2half2_rn(hi[2], hi[3]);
+}
+
+static __global__ void dequantize_block_q5_1_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t nb32) {
+    const int64_t i = blockIdx.x;
+    const int64_t tid = threadIdx.x;
+    const int64_t il = tid/8, ir = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) return;
+    half * yb = y + 256*i + 32*ir + 4*il;
+    const block_q5_1 * x = (const block_q5_1 *)vx + ib;
+    const float2 dm = __half22float2(x->dm);
+    uint32_t qh; memcpy(&qh, x->qh, sizeof(qh));
+    const uint8_t * q = x->qs + 4*il;
+    float lo[4], hi[4];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int p = 4*il + l;
+        const int xh_l = ((qh >> p)        << 4) & 0x10;
+        const int xh_h = ((qh >> (p + 12))     ) & 0x10;
+        lo[l] = (float)((q[l] & 0xF) | xh_l) * dm.x + dm.y;
+        hi[l] = (float)((q[l] >>  4) | xh_h) * dm.x + dm.y;
+    }
+    ((half2 *)(yb +  0))[0] = __floats2half2_rn(lo[0], lo[1]);
+    ((half2 *)(yb +  0))[1] = __floats2half2_rn(lo[2], lo[3]);
+    ((half2 *)(yb + 16))[0] = __floats2half2_rn(hi[0], hi[1]);
+    ((half2 *)(yb + 16))[1] = __floats2half2_rn(hi[2], hi[3]);
 }
 
 template<typename dst_t>
@@ -289,6 +384,73 @@ static void dequantize_row_q4_0_cuda(const void * vx, dst_t * y, const int64_t k
     dequantize_block_q4_0<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
+// Convert xyzkv blocks to f16 without the generic element-wise path.
+// Layout from ggml-common.h: block_xyzkv2_0 = { half norm; uint8_t qs[QK_XYZKV2/4] },
+// 128 values per block, four 2-bit indices per byte. One thread takes one byte and emits
+// 4 consecutive values, so a warp reads 32 contiguous bytes and writes 256 contiguous
+// bytes, and `norm` is one broadcast address for the whole block.
+//
+// The four centroids are scaled once into registers and then selected by predication.
+// Indexing XYZKV_CENTROIDS_2BIT[idx] directly - what the element helpers do - is a
+// divergent __constant__ read, and those serialise once per distinct address in the warp.
+static __global__ void dequantize_block_xyzkv2_0_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t nbyte) {
+    const int64_t g = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (g >= nbyte) {
+        return;
+    }
+
+    const int64_t ib = g / (QK_XYZKV2/4);   // 128-value block
+    const int     jb = g % (QK_XYZKV2/4);   // byte within it
+
+    const block_xyzkv2_0 * x = (const block_xyzkv2_0 *) vx + ib;
+
+    const float   norm = __half2float(x->norm);
+    const uint8_t qs   = x->qs[jb];
+
+    const float c0 = XYZKV_CENTROIDS_2BIT[0]*norm;
+    const float c1 = XYZKV_CENTROIDS_2BIT[1]*norm;
+    const float c2 = XYZKV_CENTROIDS_2BIT[2]*norm;
+    const float c3 = XYZKV_CENTROIDS_2BIT[3]*norm;
+
+    float v[4];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int idx = (qs >> (2*l)) & 0x3;
+        v[l] = (idx & 2) ? ((idx & 1) ? c3 : c2) : ((idx & 1) ? c1 : c0);
+    }
+
+    half * yb = y + ib*QK_XYZKV2 + 4*jb;
+    ((half2 *) yb)[0] = __floats2half2_rn(v[0], v[1]);
+    ((half2 *) yb)[1] = __floats2half2_rn(v[2], v[3]);
+}
+
+static void dequantize_block_xyzkv2_0_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int64_t nbyte = k / 4;
+    const int64_t nblk  = (nbyte + 255) / 256;
+    dequantize_block_xyzkv2_0_f16<<<nblk, 256, 0, stream>>>(vx, y, nbyte);
+}
+
+static void dequantize_block_q4_0_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int nb32 = k / 32;
+    const int nb = (k + 255) / 256;
+    dequantize_block_q4_0_f16<<<nb, 32, 0, stream>>>(vx, y, nb32);
+}
+static void dequantize_block_q4_1_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int nb32 = k / 32;
+    const int nb = (k + 255) / 256;
+    dequantize_block_q4_1_f16<<<nb, 32, 0, stream>>>(vx, y, nb32);
+}
+static void dequantize_block_q5_0_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int nb32 = k / 32;
+    const int nb = (k + 255) / 256;
+    dequantize_block_q5_0_f16<<<nb, 32, 0, stream>>>(vx, y, nb32);
+}
+static void dequantize_block_q5_1_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int nb32 = k / 32;
+    const int nb = (k + 255) / 256;
+    dequantize_block_q5_1_f16<<<nb, 32, 0, stream>>>(vx, y, nb32);
+}
+
 template<typename dst_t>
 static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb32 = k / 32;
@@ -461,6 +623,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+            case GGML_TYPE_PQ2_0:
+                return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+                case GGML_TYPE_PTQ1_0:
+                    return nullptr; // ILV16 (common.cuh): the flat converter has no matrix shape -- callers take the _nc one
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -518,13 +684,29 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+            case GGML_TYPE_PQ2_0:
+                return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+                case GGML_TYPE_PTQ1_0:
+                    return nullptr; // ILV16 (common.cuh): the flat converter has no matrix shape -- callers take the _nc one
         case GGML_TYPE_Q4_0:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_q4_0_f16_cuda;
+            }
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_q4_1_f16_cuda;
+            }
             return dequantize_row_q4_1_cuda;
         case GGML_TYPE_Q5_0:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_q5_0_f16_cuda;
+            }
             return dequantize_block_cont_cuda<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_q5_1_f16_cuda;
+            }
             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
@@ -563,6 +745,11 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_XYZKV2_0:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_xyzkv2_0_f16_cuda;
+            }
+            return dequantize_block_cont_cuda<QK_XYZKV2, QR_XYZKV2, dequantize_xyzkv2_0>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -578,6 +765,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+            case GGML_TYPE_PQ2_0:
+                return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+                case GGML_TYPE_PTQ1_0:
+                    return nullptr; // ILV16 (common.cuh): the flat converter has no matrix shape -- callers take the _nc one
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -620,6 +811,9 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_XYZKV2_0:
+            return dequantize_block_cont_cuda<QK_XYZKV2, QR_XYZKV2, dequantize_xyzkv2_0>;
+
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -637,6 +831,10 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+            case GGML_TYPE_PQ2_0:
+                return dequantize_block_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+                case GGML_TYPE_PTQ1_0:
+                    return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:
@@ -647,6 +845,9 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_XYZKV2_0:
+            return dequantize_block_cuda<QK_XYZKV2, QR_XYZKV2, dequantize_xyzkv2_0>;
+
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:
@@ -662,6 +863,10 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+            case GGML_TYPE_PQ2_0:
+                return dequantize_block_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+                case GGML_TYPE_PTQ1_0:
+                    return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:
@@ -687,6 +892,10 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+            case GGML_TYPE_PQ2_0:
+                return dequantize_block_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+                case GGML_TYPE_PTQ1_0:
+                    return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:
@@ -697,6 +906,9 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_XYZKV2_0:
+            return dequantize_block_cuda<QK_XYZKV2, QR_XYZKV2, dequantize_xyzkv2_0>;
+
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
         default:

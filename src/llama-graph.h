@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -18,6 +19,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 
 struct llama_memory_context_i;
 
@@ -136,6 +138,40 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// THE DEVICE DRAFT CHAIN (llama_draft_chain_* in llama.h). The draft context samples each step on
+// the GPU (GGML_OP_DRAFT_SAMPLE) and the next step reads the drawn token's embedding row and the feedback hidden
+// straight from these persistent tensors, so the host issues a whole draft without waiting on any step. Owned by the
+// draft llama_context; the xyz graph reads it through llm_graph_params::dchain.
+struct llama_draft_chain {
+    int32_t  mode    = 0;      // this decode: 0 off, 1 seed (host inputs, GPU draw), 2 step (inputs from the last draw)
+    int32_t  step    = 0;      // the record row this decode's draw lands in
+    uint64_t key     = 0;      // the coupled key of this draw (llama_sampler_coupled_key)
+    int32_t  top_k   = 0;
+    float    top_p   = 1.0f;
+    int32_t  n_steps = 0;
+    ggml_tensor * ids  = nullptr;           // I32 [n_col]              column -> token id
+    ggml_tensor * embd = nullptr;           // [n_embd, n_col]          the draft vocabulary's rows of the target's token_embd
+    const ggml_tensor * embd_ref = nullptr; // that token_embd (the Hadamard rotation of an embedding row keys on it)
+    ggml_tensor * col  = nullptr;           // I32 [1]                  the last draw's column
+    ggml_tensor * g    = nullptr;           // F32 [n_embd]             the last step's feedback hidden
+    ggml_tensor * rec  = nullptr;           // I32 [OUT, n_steps]       every draw of the draft
+};
+
+class llm_graph_input_draft_chain : public llm_graph_input_i {
+public:
+    llm_graph_input_draft_chain(const llama_draft_chain * dc) : dc(dc) {}
+    virtual ~llm_graph_input_draft_chain() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * key  = nullptr; // I32 [2] the coupled key, low half first
+    ggml_tensor * step = nullptr; // I32 [1] the record row
+
+    const llama_draft_chain * dc;
 };
 
 // similar to llm_graph_input_embd but with an additional hidden state input
@@ -264,6 +300,8 @@ public:
     virtual ~llm_graph_input_rs() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    // rs_replay: fills prefix_n / conv_idx; the hybrid inputs wrap an rs input and call this too
+    void set_input_replay(const llama_memory_recurrent_context * mctx_r);
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -278,6 +316,10 @@ public:
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
+    // rs_replay: the MODE is a shape (which ops exist); the per-sequence replayed counts are inputs
+    int32_t  rs_mode = 0;
+    ggml_tensor * prefix_n = nullptr; // I32 [n_seqs]              pack rows each sequence replays
+    ggml_tensor * conv_idx = nullptr; // I32 [conv_window, n_seqs] rows of [conv_state ++ pack] forming the window after the replay
     int32_t rs_z;
 };
 
@@ -343,6 +385,16 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // DEVICE KQ MASK: the small inputs of a mask the device builds (llama_kv_cache::
+    // build_kq_mask_dev) -- the cells changed since the last one and the rows' positions. All nullptr when
+    // self_kq_mask is the host-filled input.
+    ggml_tensor * kq_dev_idx  = nullptr; // I32 [n_upd]
+    ggml_tensor * kq_dev_val  = nullptr; // F32 [1, n_upd]
+    ggml_tensor * kq_dev_rows = nullptr; // F32 [1, n_tokens]
+    // POSITIONAL KQ MASK (> 16 rows, the same three inputs): self_kq_mask is then the F32 vector [qpos | kpos] that
+    // ggml_flash_attn_ext reads as the mask -- never a table, so only flash attention may consume it
+    bool          kq_pos      = false;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -805,9 +857,39 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // the logits prefilter: > 0 = also emit each output row's top-k (ids, logits); see
+    // llama_context::logits_topk. Part of the topology, so it takes part in allow_reuse.
+    int32_t logits_topk = 0;
+
+    // the device draft chain: the draft context's state and this decode's mode (a topology key)
+    const llama_draft_chain * dchain = nullptr;
+    int32_t dchain_mode = 0;
+    // 1 = a chain step drawing the draft's LAST token (step == n_steps - 1): the xyz graph may use its last-step FFN
+    // (blk.*.ffn_*.last, the 3+1 hybrid); its own graph, so the earlier steps stay exactly as they were
+    int32_t dchain_last = 0;
+
+    // Draft feature fusion appended to the target graph. The norm can precede the FC (XYZ) or follow it (DFlash).
+    // layers[] are target feature layers in drafter order; id == n_layer is the post-norm final hidden.
+    const ggml_tensor * fc_fold_w     = nullptr;
+    const ggml_tensor * fc_fold_scale = nullptr;
+    const ggml_tensor * fc_fold_norm  = nullptr;
+    float               fc_fold_eps  = 0.0f;
+    const int32_t     * fc_fold_layers   = nullptr;
+    int32_t             fc_fold_n_layers = 0;
+
+    // THE EARLY VERIFY: a verify whose rows 1..vchain_n are the draws of this (another context's)
+    // device draft chain, gathered on the device from its records (build_inp_embd). A topology key.
+    const llama_draft_chain * vchain = nullptr;
+    int32_t vchain_n = 0;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // The model itself, for weights stored in a ROTATED BASIS (see build_lora_mm). Only the Hadamard
+    // fields are ever read through it. It is fixed for the lifetime of the context, so it takes no
+    // part in allow_reuse below -- two graphs cannot differ in it.
+    const llama_model * model;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -844,6 +926,22 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (logits_topk != other.logits_topk) {
+            return false;
+        }
+
+        if (dchain_mode != other.dchain_mode || dchain_last != other.dchain_last || dchain != other.dchain) {
+            return false;
+        }
+
+        if (fc_fold_w != other.fc_fold_w || fc_fold_scale != other.fc_fold_scale) {
+            return false;
+        }
+
+        if (vchain != other.vchain || vchain_n != other.vchain_n) {
             return false;
         }
 
@@ -943,6 +1041,13 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // the logits prefilter (build_logits_topk): I32 [k, n_outputs] ids in no order, F32 [1, k, n_outputs] their logits
+    ggml_tensor * t_logits_topk_ids = nullptr;
+    ggml_tensor * t_logits_topk_val = nullptr;
+
+    // The drafter's feature-fusion result computed in this target graph, F32 [n_embd_dft, n_tokens].
+    ggml_tensor * t_fc_fold = nullptr;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1025,8 +1130,27 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_model            * model; // Hadamard rotated-basis weights only; see build_lora_mm
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const int32_t logits_topk;
+
+    const llama_draft_chain * dchain;
+    const int32_t             dchain_mode;
+    const int32_t             dchain_last;
+
+    // FC FOLD: see llm_graph_params
+    const ggml_tensor * fc_fold_w;
+    const ggml_tensor * fc_fold_scale;
+    const ggml_tensor * fc_fold_norm;
+    const float         fc_fold_eps;
+    const int32_t     * fc_fold_layers;
+    const int32_t       fc_fold_n_layers;
+
+    // the early verify: see llm_graph_params
+    const llama_draft_chain * vchain;
+    const int32_t             vchain_n;
 
     const llm_graph_cb & cb_func;
 
@@ -1040,6 +1164,10 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
+    // Build the registered feature fusion into res->t_fc_fold. h_final is the target's post-norm final hidden; other
+    // feature ids read res->t_layer_inp.
+    void build_fc_fold(ggml_tensor * h_final);
+
     //
     // common
     //
@@ -1049,6 +1177,27 @@ struct llm_graph_context {
                      int   il) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
+    // Rotate an activation into the basis the weight was quantised in, if that weight is one of the
+    // model's Hadamard-rotated tensors. Identity for every ordinary model.
+    ggml_tensor * build_hadamard_rotate(
+            ggml_tensor * w,
+            ggml_tensor * cur) const;
+
+    // The model whose rotation applies to w, by POINTER: this graph's model, or the other context's
+    // when a drafter borrows its target's tensors. nullptr = w is not a rotated tensor.
+    const llama_model * had_owner(const ggml_tensor * w) const;
+
+    // Rotated activations already built in THIS graph, keyed by (input, owner, permutation hd/nk/rep): gate/up, q/k/v
+    // and the GDN projections read the same activation through the same rotation. Same nodes, identical values.
+    mutable std::map<std::tuple<const ggml_tensor *, const llama_model *, int64_t, int64_t, int64_t>, ggml_tensor *> had_cache;
+
+    // The butterfly on its own, shared by both directions.
+    ggml_tensor * build_hadamard_fwht(const llama_model & owner, ggml_tensor * cur) const;
+
+    // get_rows on a token-embedding table, un-rotated if its owner stored it rotated. EVERY embedding
+    // lookup goes through here -- the target's own, an MTP block's, and a drafter's borrowed table.
+    ggml_tensor * build_embd_rows(ggml_tensor * table, ggml_tensor * ids) const;
+
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
@@ -1361,6 +1510,10 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    void build_logits_topk() const;
+
+    // build_embd_rows' Hadamard step alone: an embedding row taken from `table` (or from a copy of its rows)
+    ggml_tensor * build_embd_rotation(ggml_tensor * rows, const ggml_tensor * table) const;
 
     //
     // dense (out)

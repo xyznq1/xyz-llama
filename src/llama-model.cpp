@@ -324,8 +324,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen4exp(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
-        case LLM_ARCH_EAGLE3:
-            return new llama_model_eagle3(params);
+        case LLM_ARCH_XYZ:
+            return new llama_model_xyz(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
@@ -1379,6 +1379,116 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    // ---- rotated-basis weights (PrismML Ternary Bonsai 2) --------------------------------------
+    // Read straight from the gguf context rather than through llama_model_loader::get_arr, because
+    // these are vendor keys with no llm_kv enum and the templated accessor is only instantiated for
+    // enum-keyed calls. Absent keys simply leave had_enabled false, so every other model is untouched.
+    {
+        // the model's own keys are PrismML's (prism.hadamard.*); the xyz drafter carries the same data as xyz.hadamard.*
+        const std::string had_ns = gguf_find_key(ctx, "prism.hadamard.transform") >= 0 ? "prism.hadamard." : "xyz.hadamard.";
+        const auto had_key = [&](const char * k) { return gguf_find_key(ctx, (had_ns + k).c_str()); };
+        const int k_tr = had_key("transform");
+        const int k_bs = had_key("block_size");
+        const int k_sv = had_key("sign_values");
+        const int k_sw = had_key("sign_widths");
+        const int k_wn = had_key("weight_names");
+
+        if (k_tr >= 0 && k_bs >= 0 && k_sv >= 0 && k_sw >= 0 && k_wn >= 0) {
+            const std::string transform = gguf_get_val_str(ctx, k_tr);
+            had_block = gguf_get_val_u32(ctx, k_bs);
+
+            // Only the transform this code implements is accepted. A future "sylvester-…-v2" must
+            // fail loudly here rather than silently produce a model that talks confident nonsense --
+            // which is exactly how this whole problem presented in the first place.
+            if (transform != "normalized-sylvester-walsh-hadamard") {
+                throw std::runtime_error("unsupported prism.hadamard.transform: " + transform);
+            }
+            if (had_block == 0 || (had_block & (had_block - 1)) != 0) {
+                throw std::runtime_error(format("prism.hadamard.block_size %u is not a power of two", had_block));
+            }
+
+            const size_t n_sv = gguf_get_arr_n(ctx, k_sv);
+            const size_t n_sw = gguf_get_arr_n(ctx, k_sw);
+
+            // BOTH arrays are INT32 in the file (verified by dumping the metadata: sign_values is
+            // array<int32> of 28672 entries holding -1/+1, sign_widths array<int32> [5120,6144,17408]).
+            // Casting sign_values straight to const float* -- which is what this did first -- reads
+            // -1 as 0xFFFFFFFF = NaN and +1 as a 1.4e-45 denormal, so every sign comes out wrong and
+            // nothing complains. gguf_get_arr_data hands back a void* with no type check, so the
+            // element type has to be asserted here or the mistake is invisible.
+            if (gguf_get_arr_type(ctx, k_sv) != GGUF_TYPE_INT32 ||
+                gguf_get_arr_type(ctx, k_sw) != GGUF_TYPE_INT32) {
+                throw std::runtime_error("prism.hadamard sign arrays are not int32 as expected");
+            }
+            const int32_t * sv_i = (const int32_t *) gguf_get_arr_data(ctx, k_sv);
+            const int32_t * sw_i = (const int32_t *) gguf_get_arr_data(ctx, k_sw);
+
+            std::vector<float> sv_f(n_sv);
+            for (size_t i = 0; i < n_sv; ++i) {
+                if (sv_i[i] != 1 && sv_i[i] != -1) {
+                    throw std::runtime_error(format("prism.hadamard.sign_values[%zu] = %d, expected +/-1", i, sv_i[i]));
+                }
+                sv_f[i] = (float) sv_i[i];
+            }
+            const float * sv = sv_f.data();
+            std::vector<uint32_t> sw_u(n_sw);
+            for (size_t i = 0; i < n_sw; ++i) {
+                sw_u[i] = (uint32_t) sw_i[i];
+            }
+            const uint32_t * sw = sw_u.data();
+
+            // sign_values is the widths' vectors laid end to end: [5120][6144][17408] = 28,672
+            size_t off = 0;
+            for (size_t i = 0; i < n_sw; ++i) {
+                const uint32_t w = sw[i];
+                if (w % had_block != 0 || off + w > n_sv) {
+                    throw std::runtime_error(format("prism.hadamard sign width %u does not fit block %u", w, had_block));
+                }
+                had_signs[w].assign(sv + off, sv + off + w);
+                off += w;
+            }
+            if (off != n_sv) {
+                throw std::runtime_error(format("prism.hadamard sign_values has %zu entries, widths cover %zu", n_sv, off));
+            }
+
+            for (size_t i = 0, n = gguf_get_arr_n(ctx, k_wn); i < n; ++i) {
+                had_weights.insert(gguf_get_arr_str(ctx, k_wn, i));
+            }
+
+            had_enabled = !had_weights.empty();
+
+            // inverse_weight_names lists tensors whose ROTATION WAS BAKED IN THE OTHER DIRECTION.
+            // For token_embd that means get_rows hands back an already-rotated activation.
+            const int k_iw = had_key("inverse_weight_names");
+            if (k_iw >= 0) {
+                for (size_t i = 0, n = gguf_get_arr_n(ctx, k_iw); i < n; ++i) {
+                    const std::string nm = gguf_get_arr_str(ctx, k_iw, i);
+                    if (nm == "token_embd.weight") {
+                        had_embd_rotated = true;
+                    } else {
+                        // Anything else here would need its own handling; failing loudly beats a model
+                        // that talks confident nonsense.
+                        throw std::runtime_error("unhandled prism.hadamard.inverse_weight_names entry: " + nm);
+                    }
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: hadamard: block %u, %zu widths, %zu rotated tensors, embd_rotated=%d\n",
+                           __func__, had_block, had_signs.size(), had_weights.size(), (int) had_embd_rotated);
+
+            // gdn_v_grouped IS handled: it is the tiled->grouped feature-order permutation applied to
+            // ssm_out's activation in build_hadamard_rotate. With it the model measures PPL 4.17 on the
+            // corpus where our own IQ3_XXS scores 3.78; without it, 207,829.
+            if (had_key("gdn_v_grouped") >= 0) {
+                LLAMA_LOG_INFO("%s: hadamard: gdn_v_grouped -> ssm_out feature permutation "
+                               "%u x %u x %u\n", __func__,
+                               hparams.ssm_d_state, hparams.ssm_n_group,
+                               hparams.ssm_d_state && hparams.ssm_n_group
+                                   ? (hparams.ssm_d_inner / hparams.ssm_d_state) / hparams.ssm_n_group : 0);
+            }
+        }
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -1810,6 +1920,123 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
+    }
+
+    // ---- Hadamard rotated basis: the sign vectors and the transform-width marker -------------------
+    // Neither is a GGUF tensor -- the signs arrive as an int32 metadata array and the marker is
+    // synthetic -- so they cannot go through create_tensor and the mmap machinery above, and get their
+    // own small context and buffer.
+    //
+    // THIS MUST SIT ABOVE the ml.no_alloc return below, and that is not a detail. A no_alloc pass runs
+    // load_hparams (so had_signs fills) and then builds a graph to size the allocation -- which reaches
+    // build_lora_mm and asks for a sign tensor. Placed after the return, the first attempt aborted with
+    // "had_sign_t has 0: <none>; had_signs has 3" at blk.0.attn_qkv, 0.034 s in, before a single weight
+    // byte had been read. Weights are only uploaded on the real pass; the tensors themselves exist on
+    // both, matching how the loop above gives no_alloc tensors a zero-size dummy buffer.
+    if (had_enabled) {
+        for (const auto & [nm, t] : tensors_by_name) {
+            if (had_weights.count(nm) != 0) {
+                had_tensors.insert(t);
+            }
+        }
+        had_embd = had_embd_rotated ? tok_embd : nullptr;
+        LLAMA_LOG_INFO("%s: hadamard: %zu of %zu rotated tensors resolved by pointer, embedding %s\n",
+                __func__, had_tensors.size(), had_weights.size(),
+                had_embd != nullptr ? "resolved" : (had_embd_rotated ? "MISSING" : "not rotated"));
+    }
+
+    if (had_enabled && !had_signs.empty()) {
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*(had_signs.size() + 1),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context_ptr ctx_had { ggml_init(ip) };
+        if (ctx_had == nullptr) {
+            throw std::runtime_error("failed to create the hadamard context");
+        }
+        ggml_context * ctxh = ctx_had.get();
+
+        had_rot = ggml_new_tensor_2d(ctxh, GGML_TYPE_F32, had_block, had_block);
+        ggml_set_name(had_rot, "hadamard.rot");
+
+        for (const auto & [w_in, s] : had_signs) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctxh, GGML_TYPE_F32, w_in);
+            ggml_set_name(t, ("hadamard.signs." + std::to_string(w_in)).c_str());
+            had_sign_t[w_in] = t;
+        }
+
+        // Same buffer type as a weight these rotate for, so the scheduler never has to copy them
+        // across backends. output.weight is itself one of the rotated tensors; tok_embd is the
+        // fallback for a tied-embedding model where output is null.
+        // output.weight is itself one of the rotated tensors, so its buffer type is the one these
+        // should share -- but it is not guaranteed to have a buffer here (on a CPU-only load it does
+        // not, which made the model fail to load at all with "no anchor tensor"). Fall back through
+        // tok_embd and then any tensor that does have one, and only give up if the model has none.
+        ggml_tensor * anchor = nullptr;
+        for (ggml_tensor * cand : { output, tok_embd }) {
+            if (cand != nullptr && cand->buffer != nullptr) { anchor = cand; break; }
+        }
+        if (anchor == nullptr) {
+            for (const auto & [nm, t] : tensors_by_name) {
+                if (t != nullptr && t->buffer != nullptr) { anchor = t; break; }
+            }
+        }
+        // On the mmap/CPU path NO tensor has a buffer yet here -- they get one later in
+        // load_all_data -- and this block has to run before the no_alloc return, so there is nothing
+        // to copy a type from. Fall back to the CPU buffer type rather than refusing to load: these
+        // are two small tensors and the scheduler will copy them if it must.
+        ggml_backend_buffer_type_t had_buft = anchor != nullptr
+            ? ggml_backend_buffer_get_type(anchor->buffer)
+            : ggml_backend_cpu_buffer_type();
+
+        ggml_backend_buffer_t buf;
+        if (ml.no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(had_buft, /*size =*/ 0); // dummy, as above
+            for (ggml_tensor * t = ggml_get_first_tensor(ctxh); t != nullptr; t = ggml_get_next_tensor(ctxh, t)) {
+                t->buffer = buf;
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctxh, had_buft);
+        }
+        if (buf == nullptr) {
+            throw std::runtime_error("failed to allocate the hadamard buffer");
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        if (!ml.no_alloc) {
+            for (const auto & [w_in, s] : had_signs) {
+                ggml_backend_tensor_set(had_sign_t[w_in], s.data(), 0, s.size()*sizeof(float));
+            }
+
+            // The normalized Sylvester-Walsh-Hadamard: H[i][j] = (-1)^popcount(i & j) / sqrt(n).
+            // Built rather than left uninitialised so the non-intercepting reference path stays
+            // correct (see the had_rot comment in llama-model.h).
+            const uint32_t n = had_block;
+            std::vector<float> h((size_t) n*n);
+            const float scale = 1.0f/sqrtf((float) n);
+            for (uint32_t i = 0; i < n; ++i) {
+                for (uint32_t j = 0; j < n; ++j) {
+                    uint32_t v = i & j;           // parity of the popcount, portably (no __builtin_parity on MSVC)
+                    v ^= v >> 16;
+                    v ^= v >> 8;
+                    v ^= v >> 4;
+                    v ^= v >> 2;
+                    v ^= v >> 1;
+                    h[(size_t) i*n + j] = (v & 1) ? -scale : scale;
+                }
+            }
+            ggml_backend_tensor_set(had_rot, h.data(), 0, h.size()*sizeof(float));
+        }
+
+        std::vector<ggml_backend_buffer_ptr> had_bufs;
+        had_bufs.emplace_back(buf);
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx_had), std::move(had_bufs));
+
+        LLAMA_LOG_INFO("%s: hadamard: block %u, %zu sign vectors, %zu rotated tensors, marker on %s%s\n",
+                __func__, had_block, had_sign_t.size(), had_weights.size(),
+                ggml_backend_buffer_name(buf), ml.no_alloc ? " (no_alloc: shapes only)" : "");
     }
 
     if (ml.no_alloc) {
@@ -2459,6 +2686,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
+                            /* rs_pack_tokens    */ cparams.rs_pack_tokens,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
@@ -2511,6 +2739,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* rs_pack_tokens    */ cparams.rs_pack_tokens,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -2531,6 +2760,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* rs_pack_tokens    */ cparams.rs_pack_tokens,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -2551,6 +2781,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* rs_pack_tokens    */ cparams.rs_pack_tokens,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -2673,6 +2904,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add backend sampling layers (if any)
     llm->build_sampling();
+
+    // the logits prefilter (if enabled for this graph)
+    llm->build_logits_topk();
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
@@ -2868,7 +3102,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_MISTRAL3:
-        case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_XYZ:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
@@ -3086,7 +3320,7 @@ bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
-        case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_XYZ:
         case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }

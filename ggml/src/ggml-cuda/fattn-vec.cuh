@@ -84,17 +84,29 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
-    constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
+    constexpr bool K_is_unquantized = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_XYZKV2_0;
+    constexpr bool V_is_unquantized = type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_XYZKV2_0;
+    constexpr bool K_is_xyzkv = type_K == GGML_TYPE_XYZKV2_0;
+    // Xyzkv KQ dot does byte extraction + centroid lookup + scalar mul, not vectorized f16 loads.
+    // nthreads_KQ=1: each thread computes a full KQ product alone and skips warp_reduce_sum.
+    // shuffle and halves KQ loop iterations. Each thread holds full Q vector in registers.
+    constexpr int nthreads_KQ = K_is_xyzkv ? 1 : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
+    constexpr bool V_is_xyzkv = type_V == GGML_TYPE_XYZKV2_0;
+    // Xyzkv V dequant is scalar (byte extract + LUT), not vectorized loads.
+    // Halve nthreads_V to double V_cols_per_iter (process 2 V rows per loop iteration),
+    // reducing loop overhead and improving ILP in the V aggregation phase.
+    // Eighth nthreads_V for xyzkv: V_cols_per_iter grows from 4 to 8.
+    // per outer loop iteration. Halves outer loop count again, more ILP from concurrent V rows.
+    constexpr int nthreads_V  = V_is_unquantized ? (V_is_xyzkv ? (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8) : 128 / cpy_nb) : nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
+    constexpr int V_rows_per_thread = V_is_unquantized ? (V_is_xyzkv ? 4 : 2*cpy_ne) : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = !K_is_unquantized;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -121,6 +133,15 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+
+    // Shared-memory LUT for xyzkv KQ scoring: precompute Q[d] * centroid[c] once,
+    // then the hot loop does xyzkv_lut[d][idx] (shmem read, no multiply).
+    // xyzkv4 excluded: 16 centroids x D exceeds the shared-memory budget.
+    // Stride = n_centroids+1 to avoid bank conflicts.
+    constexpr int n_centroids_lut = D <= 256 && type_K == GGML_TYPE_XYZKV2_0 ? 4 : 0;
+    constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
+    __shared__ half xyzkv_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
@@ -247,6 +268,18 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
+    // Build shared-memory LUT: xyzkv_lut[d][c] = half(Q[d] * scale * centroid[c])
+    if constexpr (n_centroids_lut > 0 && ncols == 1) {
+        const float * Q_f = (const float *)(Q + 0*nb01);
+        for (int d = tid; d < D; d += nthreads) {
+            const float q_val = Q_f[d] * scale;
+            for (int c = 0; c < n_centroids_lut; c++) {
+                xyzkv_lut[d][c] = __float2half(q_val * XYZKV_CENTROIDS_2BIT[c]);
+            }
+        }
+        __syncthreads();
+    }
+
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
@@ -270,8 +303,30 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
-                sum = warp_reduce_sum<nthreads_KQ>(sum);
+                float sum;
+                if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_XYZKV2_0) {
+                    // LUT scoring for xyzkv2: 8 elements per iteration (2 qs bytes, no signs)
+                    const block_xyzkv2_0 * K_xyzkv = (const block_xyzkv2_0 *)(K + i_KQ*nb11);
+                    sum = 0.0f;
+                    for (int d0 = 0; d0 < D; d0 += 8) {
+                        const int ib = d0 / QK_XYZKV2;
+                        const int jj = d0 % QK_XYZKV2;
+                        const float norm = __half2float(K_xyzkv[ib].norm);
+                        const uint8_t qs0 = K_xyzkv[ib].qs[jj / 4];
+                        const uint8_t qs1 = K_xyzkv[ib].qs[jj / 4 + 1];
+                        sum += (__half2float(xyzkv_lut[d0  ][(qs0>>0)&3]) +
+                                __half2float(xyzkv_lut[d0+1][(qs0>>2)&3]) +
+                                __half2float(xyzkv_lut[d0+2][(qs0>>4)&3]) +
+                                __half2float(xyzkv_lut[d0+3][(qs0>>6)&3]) +
+                                __half2float(xyzkv_lut[d0+4][(qs1>>0)&3]) +
+                                __half2float(xyzkv_lut[d0+5][(qs1>>2)&3]) +
+                                __half2float(xyzkv_lut[d0+6][(qs1>>4)&3]) +
+                                __half2float(xyzkv_lut[d0+7][(qs1>>6)&3])) * norm;
+                    }
+                } else {
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    sum = warp_reduce_sum<nthreads_KQ>(sum);
+                }
 
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
@@ -609,3 +664,26 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// Xyzkv2 K and V.
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_XYZKV2_0, GGML_TYPE_XYZKV2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_XYZKV2_0, GGML_TYPE_XYZKV2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_XYZKV2_0, GGML_TYPE_XYZKV2_0);
+
+// Mixed xyzkv2/q8_0 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_XYZKV2_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_XYZKV2_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_XYZKV2_0, GGML_TYPE_Q8_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_XYZKV2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_XYZKV2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_XYZKV2_0);
+
+// Mixed f16/xyzkv2 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_XYZKV2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_XYZKV2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_XYZKV2_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_XYZKV2_0, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_XYZKV2_0, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_XYZKV2_0, GGML_TYPE_F16);

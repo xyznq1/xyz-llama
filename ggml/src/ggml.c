@@ -689,6 +689,25 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
+    // PQ2_0 uses the q2_0 codec with a 128-value scale group.
+    // from_float_ref is needed by backend tests; serving does not quantize to this type.
+    [GGML_TYPE_PQ2_0] = {
+        .type_name                = "pq2_0",
+        .blck_size                = QK_PQ2_0,
+        .type_size                = sizeof(block_pq2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_pq2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_pq2_0_ref,
+    },
+    // PTQ1_0 ternary blocks.
+    [GGML_TYPE_PTQ1_0] = {
+        .type_name                = "ptq1_0",
+        .blck_size                = QK_PTQ1_0,
+        .type_size                = sizeof(block_ptq1_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ptq1_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_ptq1_0_ref,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -942,6 +961,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_XYZKV2_0] = {
+        .type_name                = "xyzkv2",
+        .blck_size                = QK_XYZKV2,
+        .type_size                = sizeof(block_xyzkv2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_xyzkv2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_xyzkv2_0_ref,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1083,6 +1110,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "XYZKV_WHT",
+    "DRAFT_SAMPLE",
 
     "UNARY",
 
@@ -1100,7 +1129,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1227,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "xyzkv_wht(a)",
+    "draft_sample(logits, ids, key)",
 
     "unary(x)",
 
@@ -1215,7 +1246,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5418,6 +5449,44 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+// See ggml_draft_sample in ggml.h.
+
+struct ggml_tensor * ggml_draft_sample(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * col_ids,
+        struct ggml_tensor  * key,
+        struct ggml_tensor  * step,
+        struct ggml_tensor  * rec,
+        struct ggml_tensor  * col,
+        int                   top_k,
+        float                 top_p) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && col_ids->type == GGML_TYPE_I32 && key->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(logits) == ggml_nelements(col_ids) && ggml_nelements(key) == 2);
+    GGML_ASSERT(ggml_is_contiguous(logits) && ggml_is_contiguous(col_ids));
+    GGML_ASSERT(top_k >= 1 && top_k <= GGML_DRAFT_SAMPLE_MAX_K && top_k <= ggml_nelements(logits));
+    GGML_ASSERT((step == NULL) == (rec == NULL));
+    GGML_ASSERT(step == NULL || (step->type == GGML_TYPE_I32 && ggml_nelements(step) == 1));
+    GGML_ASSERT(rec  == NULL || (rec->type  == GGML_TYPE_I32 && rec->ne[0] == GGML_DRAFT_SAMPLE_OUT && ggml_is_contiguous(rec)));
+    GGML_ASSERT(col  == NULL || (col->type  == GGML_TYPE_I32 && ggml_nelements(col) == 1));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_DRAFT_SAMPLE_OUT);
+
+    int32_t params[2] = { top_k, 0 };
+    memcpy(&params[1], &top_p, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DRAFT_SAMPLE;
+    result->src[0] = logits;
+    result->src[1] = col_ids;
+    result->src[2] = key;
+    result->src[3] = step;
+    result->src[4] = rec;
+    result->src[5] = col;
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -5458,9 +5527,17 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        // An F32 vector [qpos (n_q) | kpos (n_kv)] replaces the [n_kv, n_q] F16 table.
+        // Cell i is visible to query row j iff kpos[i] < qpos[j]. Empty cells use +inf.
+        // This represents a single-sequence causal mask with no ALiBi; n_q = ne[0] - n_kv.
+        const bool pos_mask = mask->type == GGML_TYPE_F32;
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || pos_mask);
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
+        if (pos_mask) {
+            GGML_ASSERT(ggml_is_vector(mask) && mask->ne[0] >= k->ne[1] + q->ne[1]);
+            GGML_ASSERT(max_bias == 0.0f && q->ne[3] == 1);
+        }
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
         GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
@@ -6349,11 +6426,72 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(state->ne[2] == H);
     GGML_ASSERT(state->ne[3] == n_seqs);
     GGML_ASSERT(K >= 1);
+
+    return ggml_gated_delta_net_ext(ctx, q, k, v, g, beta, state, NULL, NULL, K, 0);
+}
+
+int64_t ggml_gated_delta_net_pack_row(int64_t S_k, int64_t H_k, int64_t S_v, int64_t H_v, bool kda) {
+    return 2 * H_k * S_k + H_v * S_v + (kda ? H_v * S_v : H_v) + H_v;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * prefix,
+        struct ggml_tensor  * prefix_n,
+        int64_t               K,
+        int32_t               flags) {
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int64_t S_k      = q->ne[0];
+    const int64_t H_k      = q->ne[1];
+    const bool    kda      = g->ne[0] == S_v;
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(state->ne[0] == S_v);
+    GGML_ASSERT(state->ne[1] == S_v);
+    GGML_ASSERT(state->ne[2] == H);
+    GGML_ASSERT(state->ne[3] == n_seqs);
+    GGML_ASSERT(K >= 1);
+
+    const int64_t pack_row = ggml_gated_delta_net_pack_row(S_k, H_k, S_v, H, kda);
+
+    int64_t n_prev = 0;
+    if (prefix != NULL) {
+        GGML_ASSERT(K == 1 && "prefix replay keeps a single (committed) state");
+        GGML_ASSERT(prefix->type == GGML_TYPE_F32);
+        GGML_ASSERT(prefix->nb[0] == sizeof(float) && prefix->nb[1] == (size_t) pack_row * sizeof(float)); // rows packed; the seq stride may pad
+        GGML_ASSERT(prefix->ne[0] == pack_row);
+        GGML_ASSERT(prefix->ne[2] == n_seqs);
+        n_prev = prefix->ne[1];
+    }
+    if (prefix_n != NULL) {
+        GGML_ASSERT(prefix != NULL && "per-sequence replay counts need a prefix");
+        GGML_ASSERT(prefix_n->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(prefix_n) && prefix_n->ne[0] == n_seqs && ggml_nelements(prefix_n) == n_seqs);
+    }
+
+    const int64_t row        = S_v * H;
     const int64_t state_rows = K * S_v * n_seqs;
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    int64_t pack_rows = 0;
+    if (flags & GGML_GDN_WRITE_PACK) {
+        const int64_t pack_floats = pack_row * n_tokens * n_seqs;
+        pack_rows = (pack_floats + row - 1) / row;
+    }
+    const int64_t ne[4] = { row, n_tokens * n_seqs + state_rows + pack_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_prev);
+    ggml_set_op_params_i32(result, 2, flags);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6362,6 +6500,8 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = prefix;
+    result->src[7] = prefix_n;
 
     return result;
 }
@@ -6524,6 +6664,38 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_xyzkv_wht
+
+struct ggml_tensor * ggml_xyzkv_wht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   direction,
+        int                   group_size,
+        struct ggml_tensor  * scale) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(direction == 0 || direction == 1);
+
+    // Auto-detect group size from tensor dimension if not specified
+    if (group_size == 0) {
+        group_size = (a->ne[0] % 128 == 0) ? 128 : 64;
+    }
+    GGML_ASSERT(group_size == 32 || group_size == 64 || group_size == 128);
+    GGML_ASSERT(a->ne[0] % group_size == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);
+
+    result->op = GGML_OP_XYZKV_WHT;
+    result->src[0] = a;
+    result->src[1] = scale;  // InnerQ scale_inv (NULL = no scaling)
+
+    // Store direction and group_size in op_params
+    memcpy(result->op_params + 0, &direction, sizeof(int));
+    memcpy(result->op_params + sizeof(int), &group_size, sizeof(int));
 
     return result;
 }
@@ -8001,6 +8173,8 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_PQ2_0:   result = quantize_pq2_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_PTQ1_0:  result = quantize_ptq1_0 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -8024,6 +8198,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_XYZKV2_0: result = quantize_xyzkv2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

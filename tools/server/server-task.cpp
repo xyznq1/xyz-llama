@@ -10,6 +10,10 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
 #include <sstream>
 
 //
@@ -1688,6 +1692,186 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// ---- the SSD tier of the prompt cache (see server-task.h) ----
+namespace {
+constexpr uint32_t PC_DISK_MAGIC   = 0x3143504Au;   // "JPC1"
+constexpr uint32_t PC_DISK_VERSION = 1;
+constexpr uint64_t PC_DISK_MAX_VEC = 1ull << 36;    // sanity bound on any stored byte vector
+
+bool pc_write(FILE * f, const void * p, size_t n) { return n == 0 || fwrite(p, 1, n, f) == n; }
+template <typename T> bool pc_put(FILE * f, const T & v) { return pc_write(f, &v, sizeof(v)); }
+bool pc_put_vec(FILE * f, const std::vector<uint8_t> & v) {
+    const uint64_t n = v.size();
+    return pc_put(f, n) && pc_write(f, v.data(), v.size());
+}
+bool pc_read(FILE * f, void * p, size_t n) { return n == 0 || fread(p, 1, n, f) == n; }
+template <typename T> bool pc_get(FILE * f, T & v) { return pc_read(f, &v, sizeof(v)); }
+bool pc_get_vec(FILE * f, std::vector<uint8_t> & v) {
+    uint64_t n = 0;
+    if (!pc_get(f, n) || n > PC_DISK_MAX_VEC) {
+        return false;
+    }
+    v.resize((size_t) n);
+    return pc_read(f, v.data(), (size_t) n);
+}
+uint64_t pc_hash(const llama_tokens & t) {           // FNV-1a over the token ids: the file name
+    uint64_t h = 1469598103934665603ull;
+    for (const llama_token x : t) {
+        h ^= (uint32_t) x;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+size_t pc_common_prefix(const llama_tokens & a, const llama_tokens & b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return i;
+}
+bool pc_read_head(FILE * f, llama_tokens & tokens) {  // magic, version, tokens: what the index keeps
+    uint32_t magic = 0, version = 0;
+    uint64_t n = 0;
+    if (!pc_get(f, magic) || !pc_get(f, version) || magic != PC_DISK_MAGIC || version != PC_DISK_VERSION) {
+        return false;
+    }
+    if (!pc_get(f, n) || n > (1ull << 26)) {
+        return false;
+    }
+    tokens.resize((size_t) n);
+    return pc_read(f, tokens.data(), (size_t) n * sizeof(llama_token));
+}
+} // namespace
+
+void server_prompt_cache::disk_init() {
+    const char * dir = getenv("XYZ_PC_DISK_DIR");
+    if (dir == nullptr || dir[0] == '\0') {
+        return;
+    }
+    const char * gb = getenv("XYZ_PC_DISK_GB");
+    disk_limit = (size_t) (std::max(1.0, gb ? atof(gb) : 40.0) * 1024.0 * 1024.0 * 1024.0);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        SRV_WRN("[PC-DISK] cannot create %s (%s): SSD tier off\n", dir, ec.message().c_str());
+        return;
+    }
+    disk_dir = dir;
+    // the index is the folder itself, oldest first -- so evicted conversations survive a server restart too
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> files;
+    for (const auto & e : std::filesystem::directory_iterator(disk_dir, ec)) {
+        if (e.is_regular_file() && e.path().extension() == ".jpc") {
+            files.emplace_back(e.last_write_time(), e.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto & fp : files) {
+        FILE * f = fopen(fp.second.string().c_str(), "rb");
+        disk_entry de;
+        const bool ok = f != nullptr && pc_read_head(f, de.tokens);
+        if (f) {
+            fclose(f);
+        }
+        if (!ok) {
+            SRV_WRN("[PC-DISK] skipping unreadable %s\n", fp.second.string().c_str());
+            continue;
+        }
+        de.path  = fp.second.string();
+        de.bytes = (size_t) std::filesystem::file_size(fp.second, ec);
+        disk_bytes += de.bytes;
+        disk.push_back(std::move(de));
+    }
+    while (!disk.empty() && disk_bytes > disk_limit) {
+        disk_drop_front();
+    }
+    SRV_INF("[PC-DISK] SSD tier on: %s, %zu states, %.2f of %.1f GiB\n", disk_dir.c_str(), disk.size(),
+            disk_bytes / 1073741824.0, disk_limit / 1073741824.0);
+}
+
+void server_prompt_cache::disk_drop_front() {
+    std::error_code ec;
+    std::filesystem::remove(disk.front().path, ec);
+    disk_bytes -= std::min(disk_bytes, disk.front().bytes);
+    disk.pop_front();
+}
+
+bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
+    if (disk_dir.empty() || state.prompt.tokens.has_mtmd || state.data.main.empty()) {
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
+    // entries that are a prefix of this one are obsolete (the RAM tier's rule)
+    for (auto it = disk.begin(); it != disk.end();) {
+        if (pc_common_prefix(it->tokens, tokens) == it->tokens.size()) {
+            std::error_code ec;
+            std::filesystem::remove(it->path, ec);
+            disk_bytes -= std::min(disk_bytes, it->bytes);
+            it = disk.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    const size_t need = state.size() + tokens.size() * sizeof(llama_token) + 4096;
+    if (need > disk_limit) {
+        return false;
+    }
+    while (!disk.empty() && disk_bytes + need > disk_limit) {
+        disk_drop_front();
+    }
+    char name[64];
+    snprintf(name, sizeof(name), "pc_%016llx_%zu.jpc", (unsigned long long) pc_hash(tokens), tokens.size());
+    const std::string path = (std::filesystem::path(disk_dir) / name).string();
+    const std::string tmp  = path + ".tmp";
+    FILE * f  = fopen(tmp.c_str(), "wb");
+    bool   ok = f != nullptr;
+    if (ok) {
+        const uint64_t n      = tokens.size();
+        const uint32_t n_ckpt = (uint32_t) state.prompt.checkpoints.size();
+        ok = pc_put(f, PC_DISK_MAGIC) && pc_put(f, PC_DISK_VERSION) && pc_put(f, n) &&
+             pc_write(f, tokens.data(), tokens.size() * sizeof(llama_token)) && pc_put(f, n_ckpt);
+        for (const auto & c : state.prompt.checkpoints) {
+            if (!ok) {
+                break;
+            }
+            const int64_t n_tok = c.n_tokens;
+            const int32_t id    = c.id_task;
+            const int32_t pmin  = c.pos_min;
+            const int32_t pmax  = c.pos_max;
+            ok = pc_put(f, n_tok) && pc_put(f, id) && pc_put(f, pmin) && pc_put(f, pmax) &&
+                 pc_put_vec(f, c.data_tgt) && pc_put_vec(f, c.data_dft) && pc_put_vec(f, c.data_spec);
+        }
+        ok = ok && pc_put_vec(f, state.data.main) && pc_put_vec(f, state.data.drft);
+        ok = (fclose(f) == 0) && ok;
+    }
+    std::error_code ec;
+    if (ok) {
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        SRV_WRN("[PC-DISK] spill of %zu tokens FAILED (%s)\n", tokens.size(), path.c_str());
+        return false;
+    }
+    disk_entry de;
+    de.tokens = tokens;
+    de.path   = path;
+    de.bytes  = (size_t) std::filesystem::file_size(path, ec);
+    disk_bytes += de.bytes;
+    disk.push_back(std::move(de));
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    SRV_INF("[PC-DISK] spilled %zu tokens, %.1f MiB, %zu checkpoints in %.0f ms -> %s (%zu states, %.2f GiB)\n",
+            tokens.size(), state.size() / 1048576.0, state.prompt.checkpoints.size(), ms, name, disk.size(),
+            disk_bytes / 1073741824.0);
+    return true;
+}
+
+void server_prompt_cache::evict_front() {
+    disk_spill(states.front());
+    states.pop_front();
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1753,7 +1937,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front();
         }
     }
 
@@ -1822,6 +2006,84 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    // the SSD tier, same criteria: a file wins only when it beats the RAM candidates and the slot's own prompt
+    auto dk_best = disk.end();
+    if (!disk.empty() && !tokens_new.has_mtmd && tokens_new.size() > 0) {
+        const llama_tokens tnew = tokens_new.get_text_tokens();
+        for (auto it = disk.begin(); it != disk.end(); ++it) {
+            const size_t lcp_cur    = pc_common_prefix(it->tokens, tnew);
+            const float  f_keep_cur = it->tokens.empty() ? 0.0f : float(lcp_cur) / it->tokens.size();
+            const float  f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+            if (f_keep_cur < 0.25f) {
+                continue;
+            }
+            if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+                f_keep_best = f_keep_cur;
+                f_sim_best  = f_sim_cur;
+
+                dk_best = it;
+            }
+        }
+    }
+    if (dk_best != disk.end()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        FILE * f = fopen(dk_best->path.c_str(), "rb");
+        llama_tokens toks;
+        std::list<common_prompt_checkpoint> ckpts;
+        std::vector<uint8_t> data_main;
+        std::vector<uint8_t> data_drft;
+        uint32_t n_ckpt = 0;
+        bool ok = f != nullptr && pc_read_head(f, toks) && pc_get(f, n_ckpt) && n_ckpt < 4096;
+        for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
+            common_prompt_checkpoint c;
+            int64_t n_tok = 0;
+            int32_t id = -1, pmin = 0, pmax = 0;
+            ok = pc_get(f, n_tok) && pc_get(f, id) && pc_get(f, pmin) && pc_get(f, pmax) &&
+                 pc_get_vec(f, c.data_tgt) && pc_get_vec(f, c.data_dft) && pc_get_vec(f, c.data_spec);
+            c.n_tokens = n_tok;
+            c.id_task  = id;
+            c.pos_min  = pmin;
+            c.pos_max  = pmax;
+            if (ok) {
+                ckpts.push_back(std::move(c));
+            }
+        }
+        ok = ok && pc_get_vec(f, data_main) && pc_get_vec(f, data_drft);
+        if (f) {
+            fclose(f);
+        }
+        // the file leaves the SSD tier either way: its state moves into the slot, or it was unreadable
+        const std::string path = dk_best->path;
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        disk_bytes -= std::min(disk_bytes, dk_best->bytes);
+        disk.erase(dk_best);
+        if (!ok || toks.empty() || data_main.empty()) {
+            SRV_WRN("[PC-DISK] unreadable state %s -- prefilling instead\n", path.c_str());
+            return true;
+        }
+        if (llama_state_seq_set_data_ext(ctx_tgt, data_main.data(), data_main.size(), id_slot, 0) != data_main.size()) {
+            SRV_ERR("[PC-DISK] failed to restore state with size %zu\n", data_main.size());
+            return false;
+        }
+        if (!data_drft.empty()) {
+            GGML_ASSERT(ctx_dft);
+            if (llama_state_seq_set_data_ext(ctx_dft, data_drft.data(), data_drft.size(), id_slot, 0) != data_drft.size()) {
+                SRV_WRN("[PC-DISK] failed to restore draft state with size %zu\n", data_drft.size());
+                return false;
+            }
+        }
+        const size_t n_toks = toks.size();
+        prompt.tokens      = server_tokens(toks, false);
+        prompt.checkpoints = std::move(ckpts);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        SRV_INF("[PC-DISK] restored %zu tokens (%.1f MiB, %zu checkpoints) from the SSD in %.0f ms, f_keep %.3f f_sim %.3f\n",
+                n_toks, (data_main.size() + data_drft.size()) / 1048576.0, prompt.checkpoints.size(), ms, f_keep_best,
+                f_sim_best);
+        return true;
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -1872,7 +2134,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front();
         }
     }
 
@@ -1887,7 +2149,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front();
         }
     }
 

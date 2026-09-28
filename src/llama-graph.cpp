@@ -20,9 +20,20 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <array>
+#include <map>
+#include <string>
+#include <typeinfo>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+// Every KV cache type whose contents are stored in the WHT-rotated domain: it decides whether the graph gets the
+// forward rotation on Q and the inverse rotation on the attention output, so it has to agree with the CUDA set_rows
+// encoders exactly (a cache encoded rotated and never un-rotated gives no error, just incoherent output).
+static inline bool xyzkv_is_rotated_kv(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_XYZKV2_0;
+}
 
 // dedup helpers
 
@@ -67,8 +78,10 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
-        const int64_t n_tokens = ubatch->n_tokens;
+    if (ubatch->token && tokens->buffer != nullptr) {
+        // tokens holds fewer rows than the ubatch only in an early verify: row 0's token, the draft rows come from the
+        // draft chain on the device
+        const int64_t n_tokens = std::min<int64_t>(ubatch->n_tokens, tokens->ne[0]);
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
@@ -85,10 +98,23 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+    // an early verify looks up row 0 only (build_inp_embd); allow_reuse has matched vchain already
+    const bool vc = params.vchain != nullptr && params.ubatch.token && params.ubatch.n_tokens == (uint32_t) params.vchain_n + 1;
+    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == (vc ? 1 : (int64_t) params.ubatch.n_tokens));
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
 
     return res;
+}
+
+void llm_graph_input_draft_chain::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    const int32_t k2[2] = { (int32_t) (uint32_t) (dc->key & 0xFFFFFFFFull), (int32_t) (uint32_t) (dc->key >> 32) };
+    ggml_backend_tensor_set(key, k2, 0, sizeof(k2));
+    ggml_backend_tensor_set(step, &dc->step, 0, sizeof(int32_t));
+}
+
+bool llm_graph_input_draft_chain::can_reuse(const llm_graph_params & params) {
+    return params.dchain == dc;   // the values are written on every decode
 }
 
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
@@ -214,13 +240,22 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     GGML_ASSERT(ubatch->output);
 
-    int n_outputs = 0;
+    // This loop writes one index per output flag into out_ids, a buffer sized by the MEMBER n_outputs, so the count
+    // has its own name (a local n_outputs would shadow the member) and is bounded and checked. While every round
+    // verifies the same number of columns the two counts agree; with --spec-draft-p-min the draft length varies per
+    // round, and a flag count above the built size would write past out_ids -- GET_ROWS on result_norm would then
+    // gather garbage indices and the GPU would raise an illegal memory access with no host-side assert to point at
+    // the cause.
+    int n_filled = 0;
 
     for (int i = 0; i < n_tokens; ++i) {
         if (ubatch->output[i]) {
-            data[n_outputs++] = i;
+            GGML_ASSERT(n_filled < n_outputs && "out_ids overflow: more output flags than the graph was built for");
+            data[n_filled++] = i;
         }
     }
+
+    GGML_ASSERT(n_filled == n_outputs && "out_ids underflow: fewer output flags than the graph was built for");
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
@@ -340,6 +375,43 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+    set_input_replay(mctx);
+}
+
+void llm_graph_input_rs::set_input_replay(const llama_memory_recurrent_context * mctx_r) {
+    if (prefix_n) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(prefix_n->buffer));
+        int32_t * data = (int32_t *) prefix_n->data;
+        for (int64_t s = 0; s < prefix_n->ne[0]; ++s) {
+            data[s] = mctx_r->get_pending((uint32_t) s);
+        }
+    }
+    if (conv_idx) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(conv_idx->buffer));
+        int32_t * data = (int32_t *) conv_idx->data;
+        const int64_t W = conv_idx->ne[0];
+        // The gathered tensor is [conv_state(W) ++ pack(P)], so a row index is valid only in [0, W + P). The fill
+        // below is in bounds exactly while p <= P, which llama_memory_recurrent asserts -- but ONLY for the
+        // sequences it walks. A row index past W + P is an out-of-bounds ggml_get_rows on the GPU: an illegal
+        // memory access raised at the kernel launch, with no host-side assert to catch it. That is the failure every
+        // --spec-draft-p-min > 0 run hit (0.30/0.50/0.70 all died; p_min 0 and a FIXED n_max=2 were both clean, and
+        // LLAMA_RS_REPLAY=0 made p_min 0.50 clean -- so it is variable draft length through this path, nothing else).
+        // Clamping keeps the gather in bounds and logs when it had to, so the upstream invariant break is visible
+        // rather than silent. If the log never fires, conv_idx was not the out-of-bounds site.
+        const int32_t P = (int32_t) mctx_r->get_pack_tokens();
+        for (int64_t s = 0; s < conv_idx->ne[1]; ++s) {
+            const int32_t p_raw = mctx_r->get_pending((uint32_t) s);
+            const int32_t p     = p_raw < 0 ? 0 : (p_raw > P ? P : p_raw);
+            if (p != p_raw) {
+                LLAMA_LOG_WARN("%s: conv_idx seq %d: pending %d outside [0, pack_tokens=%d] -- clamped to %d "
+                               "(would have gathered row %d of %d)\n",
+                               __func__, (int) s, p_raw, P, p, p_raw + (int) W - 1, (int) W + P);
+            }
+            for (int64_t j = 0; j < W; ++j) {
+                data[s * W + j] = p + (int32_t) j; // window rows [p, p + W) of [conv_state(W) ++ pack(P)]
+            }
+        }
+    }
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -356,6 +428,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    // snapshot-free rollback: the replay MODE selects which ops the graph has (plain / pack / commit-
+    // with-prefix) so it must match; the per-sequence replayed counts are inputs (prefix_n, conv_idx)
+    // so the graph is reused across rounds. History: the first cut baked the prefix length into the
+    // shape -- reused forever, then rebuilt every round (1.75 ms host).
+    res &= rs_mode == mctx->get_rs_mode();
 
     return res;
 }
@@ -472,8 +549,13 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     // the mask is left unallocated when the graph only stores K/V without attending
-    // (e.g. DFlash's KV-injection pass)
-    if (self_kq_mask && self_kq_mask->buffer) {
+    // (e.g. DFlash's KV-injection pass). The device mask's inputs likewise: they are filled -- and the cells they
+    // carry taken off the dirty list -- only when this graph really runs the scatter into the positions' mirror.
+    if (kq_dev_rows != nullptr) {
+        if (kq_dev_idx->buffer && kq_dev_val->buffer && kq_dev_rows->buffer) {
+            mctx->set_input_kq_mask_dev(kq_dev_idx, kq_dev_val, kq_dev_rows, ubatch);
+        }
+    } else if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
@@ -484,6 +566,19 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+}
+
+// a graph built with the device mask is reused only by a ubatch that qualifies for it again, with the same update
+// bucket (and a host-mask graph only by one that does not)
+static bool can_reuse_kq_mask_dev(const llm_graph_input_attn_kv * inp, const llama_kv_cache_context * mctx,
+                                  const llm_graph_params & params) {
+    // the positional mask (> 16 rows) and the device mask (<= 16) use the same inputs; a graph is reused only in its own mode
+    const bool pos = params.cparams.flash_attn && mctx->kq_mask_pos_ok(params.ubatch, params.cparams.causal_attn);
+    const bool dev = !pos && mctx->kq_mask_dev_ok(params.ubatch, params.cparams.causal_attn);
+    if (pos != inp->kq_pos || (pos || dev) != (inp->kq_dev_rows != nullptr)) {
+        return false;
+    }
+    return !(pos || dev) || inp->kq_dev_idx->ne[0] == (int64_t) mctx->kq_mask_dev_nupd();
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -497,6 +592,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask_dev(this, mctx, params);
 
     return res;
 }
@@ -1087,7 +1183,13 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->kq_dev_rows != nullptr) {   // the device mask: see llm_graph_input_attn_kv::set_input
+        if (inp_attn->kq_dev_idx->buffer && inp_attn->kq_dev_val->buffer && inp_attn->kq_dev_rows->buffer) {
+            mctx->get_attn()->set_input_kq_mask_dev(inp_attn->kq_dev_idx, inp_attn->kq_dev_val, inp_attn->kq_dev_rows, ubatch);
+        }
+    } else {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1108,6 +1210,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    inp_rs->set_input_replay(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1121,6 +1224,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask_dev(inp_attn.get(), mctx->get_attn(), params);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1129,6 +1233,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_mode == mctx->get_recr()->get_rs_mode(); // rs_replay: the mode selects the ops; counts are inputs
 
     return res;
 }
@@ -1152,6 +1257,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    inp_rs->set_input_replay(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1172,6 +1278,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_mode == mctx->get_recr()->get_rs_mode(); // rs_replay: the mode selects the ops; counts are inputs
 
     return res;
 }
@@ -1226,6 +1333,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    inp_rs->set_input_replay(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1260,6 +1368,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_mode == mctx->get_recr()->get_rs_mode(); // rs_replay: the mode selects the ops; counts are inputs
 
     return res;
 }
@@ -1332,6 +1441,10 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
+    t_logits_topk_ids = nullptr;
+    t_logits_topk_val = nullptr;
+    t_fc_fold         = nullptr;
+
     params = {};
 
     inputs.clear();
@@ -1368,6 +1481,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_fc_fold != nullptr) {
+        ggml_set_output(t_fc_fold);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -1486,7 +1602,20 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    model            (params.model),
     samplers         (params.samplers),
+    logits_topk      (params.logits_topk),
+    dchain           (params.dchain),
+    dchain_mode      (params.dchain_mode),
+    dchain_last      (params.dchain_last),
+    fc_fold_w        (params.fc_fold_w),
+    fc_fold_scale    (params.fc_fold_scale),
+    fc_fold_norm     (params.fc_fold_norm),
+    fc_fold_eps      (params.fc_fold_eps),
+    fc_fold_layers   (params.fc_fold_layers),
+    fc_fold_n_layers (params.fc_fold_n_layers),
+    vchain           (params.vchain),
+    vchain_n         (params.vchain_n),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1500,6 +1629,39 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+// FC FOLD. The xyz drafter's first op is its feature fusion g = fc([norm](concat(target layers))), run as a
+// SEPARATE llama_encode on the draft context after every target decode (xyz.cpp graph<true>): the target's feature
+// rows go down to the host, up again for the encoder, the encoder runs, and g comes down again before the seed step can
+// be built (~0.3 ms of GPU idle per round). Here the same ops run at the end of the TARGET graph, where the features
+// already are, and only g comes down. Bit-identical: the column layout is the host's (feature k of token i at rows
+// [k*n_embd, (k+1)*n_embd) of column i), the norm is the same RMS_NORM + MUL with the drafter's eps, and the matmul is
+// the same op on the same weight.
+void llm_graph_context::build_fc_fold(ggml_tensor * h_final) {
+    if (fc_fold_w == nullptr || fc_fold_n_layers <= 0) {
+        return;
+    }
+    ggml_tensor * feat = nullptr;
+    for (int32_t k = 0; k < fc_fold_n_layers; ++k) {
+        const int32_t id = fc_fold_layers[k];
+        ggml_tensor * t = id < (int32_t) n_layer ? res->t_layer_inp[id] : h_final;
+        GGML_ASSERT(t != nullptr && t->ne[0] == n_embd && "fc fold: feature layer tensor missing");
+        feat = feat == nullptr ? t : ggml_concat(ctx0, feat, t, 0);
+    }
+    GGML_ASSERT(feat->ne[0] == fc_fold_w->ne[0] && "fc fold: feature width != fc input width");
+    if (fc_fold_norm != nullptr) {
+        GGML_ASSERT(fc_fold_norm->ne[0] == feat->ne[0]);
+        feat = ggml_rms_norm(ctx0, feat, fc_fold_eps);
+        feat = ggml_mul(ctx0, feat, const_cast<ggml_tensor *>(fc_fold_norm));
+    }
+    ggml_tensor * g = ggml_mul_mat(ctx0, const_cast<ggml_tensor *>(fc_fold_w), feat);
+    if (fc_fold_scale != nullptr) {
+        g = ggml_mul(ctx0, g, const_cast<ggml_tensor *>(fc_fold_scale));
+    }
+    cb(g, "fc_fold", -1);
+    res->t_fc_fold = g;
+    ggml_build_forward_expand(gf, g);
+}
+
 
 
 ggml_tensor * llm_graph_context::build_cvec(
@@ -1508,10 +1670,163 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+// Weights stored in a ROTATED BASIS (PrismML's Ternary Bonsai 2 and anything else declaring prism.hadamard.*). The
+// GGUF holds W_rot = W * diag(s) * H, where H is the normalized Sylvester-Walsh-Hadamard over the INPUT dimension in
+// fixed-width blocks and s is a +/-1 vector. Both factors are orthogonal and self-inverse, so the original product is
+// recovered by rotating the ACTIVATION the same way instead of un-rotating the weight:
+//
+//     y = W * x = W_rot * (H * diag(s) * x)          -- signs first, then the butterfly
+//
+// The rotation is what makes a 1.75-bpw ternary quantisation of W survivable, and rotating the activation is far
+// cheaper than un-rotating the weights (N log N over a [5120, n_tokens] activation against a 17408x5120 matmul). It
+// lives in build_lora_mm so every rotated call site, ffn_down included, goes through it.
+//
+// The model a rotated tensor belongs to is found by POINTER: the rotation is a property of the tensor (fixed by the file
+// it was loaded from), and a drafter's graph multiplies by its TARGET's token_embd and output. nullptr = not rotated.
+const llama_model * llm_graph_context::had_owner(const ggml_tensor * w) const {
+    if (w == nullptr) {
+        return nullptr;
+    }
+    const llama_model * other = cparams.ctx_other != nullptr ? llama_get_model(cparams.ctx_other) : nullptr;
+    for (const llama_model * m : { model, other }) {
+        if (m != nullptr && m->had_enabled && m->had_tensors.count(w) != 0) {
+            return m;
+        }
+    }
+    return nullptr;
+}
+
+ggml_tensor * llm_graph_context::build_hadamard_rotate(ggml_tensor * w, ggml_tensor * cur) const {
+    const llama_model * m = had_owner(w);
+    if (m == nullptr) {
+        return cur;
+    }
+    const ggml_tensor * const cur_in = cur;   // the cache key: the caller's activation, before any cont below
+
+    const auto it_s = m->had_sign_t.find((uint32_t) cur->ne[0]);
+    // not a soft failure: a rotated weight without a sign vector for its input width would silently produce a
+    // plausible-looking wrong answer (GGML_ABORT writes to stderr itself, before the process dies)
+    if (it_s == m->had_sign_t.end()) {
+        std::string have;
+        for (const auto & [w_in, t] : m->had_sign_t) {
+            have += " " + std::to_string(w_in);
+        }
+        std::string want;
+        for (const auto & [w_in, v] : m->had_signs) {
+            want += " " + std::to_string(w_in) + "(" + std::to_string(v.size()) + ")";
+        }
+        GGML_ABORT("hadamard: weight '%s' wants a sign vector for input width %d; had_sign_t has %d:%s;"
+                   " had_signs has %d:%s; had_weights %d; block %u",
+                   ggml_get_name(w), (int) cur->ne[0], (int) m->had_sign_t.size(),
+                   have.empty() ? " <none>" : have.c_str(),
+                   (int) m->had_signs.size(), want.empty() ? " <none>" : want.c_str(),
+                   (int) m->had_weights.size(), m->had_block);
+    }
+    GGML_ASSERT(m->had_rot != nullptr && "rotated weights present but no Hadamard block marker");
+
+    if (!ggml_is_contiguous(cur)) {
+        cur = ggml_cont(ctx0, cur);
+    }
+
+    // FEATURE-ORDER PERMUTATION, before the signs: the quantiser saw ssm_out's input in GROUPED [hd, rep, nk] order, the
+    // graph produces TILED [hd, nk, rep] (6144 = 128 x 16 x 3 on Bonsai 27B; perplexity 207,829 without it, 4.17 with it).
+    // Only ssm_out: the other roles are flat feature vectors. Derived from the OWNER's hparams, so a drafter's graph
+    // judges a borrowed tensor by the model it belongs to.
+    int64_t hd = 0, nk = 0, rep = 0;
+    {
+        std::string role = ggml_get_name(w);   // the tensor name without its "blk.N." prefix
+        const size_t dot = role.find('.', 4);
+        if (role.compare(0, 4, "blk.") == 0 && dot != std::string::npos) {
+            role = role.substr(dot + 1);
+        }
+        const uint32_t d = m->hparams.ssm_d_state, g = m->hparams.ssm_n_group, inner = m->hparams.ssm_d_inner;
+        if (role == "ssm_out.weight" && d != 0 && g != 0 && inner % d == 0 && (inner / d) % g == 0 && inner / d / g > 1) {
+            hd = d; nk = g; rep = inner / d / g;
+        }
+    }
+
+    const auto key = std::make_tuple(cur_in, m, hd, nk, rep);
+    const auto it_c = had_cache.find(key);
+    if (it_c != had_cache.end()) {
+        return it_c->second;
+    }
+    if (rep > 1) {
+        GGML_ASSERT(hd*nk*rep == cur->ne[0] && "hadamard perm geometry does not match the input width");
+        ggml_tensor * x = cur;
+        const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+        x   = ggml_reshape_4d(ctx0, x, hd, nk, rep, ne1*ne2*ne3);
+        x   = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+        cur = ggml_reshape_4d(ctx0, x, hd*nk*rep, ne1, ne2, ne3);
+    }
+
+    // signs, then the butterfly (the stored W*diag(s)*H)
+    cur = ggml_mul(ctx0, cur, it_s->second);
+    cur = build_hadamard_fwht(*m, cur);
+
+    had_cache[key] = cur;
+    return cur;
+}
+
+// The butterfly itself, shared by both directions so they cannot drift apart: H is symmetric and orthogonal, so the same
+// node serves the rotation and its inverse; only the ORDER relative to the sign multiply differs between the callers.
+// It is a matmul against had_rot (the real normalized Hadamard matrix) that the backend runs as a fast transform.
+ggml_tensor * llm_graph_context::build_hadamard_fwht(const llama_model & owner, ggml_tensor * cur) const {
+    const int64_t n = owner.had_block;
+    const int64_t ne0 = cur->ne[0], ne1 = cur->ne[1], ne2 = cur->ne[2], ne3 = cur->ne[3];
+
+    if (!ggml_is_contiguous(cur)) {
+        cur = ggml_cont(ctx0, cur);
+    }
+
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, cur, n, ggml_nelements(cur)/n);
+    ggml_tensor * rot  = ggml_mul_mat(ctx0, owner.had_rot, flat);
+    ggml_mul_mat_set_hint(rot, GGML_HINT_SRC0_IS_HADAMARD);
+
+    return ggml_reshape_4d(ctx0, rot, ne0, ne1, ne2, ne3);
+}
+
+// The embedding is stored ROTATED (prism.hadamard.inverse_weight_names lists token_embd.weight). A stored row is
+// H*diag(s)*e, so the original is diag(s)*H*r: the BUTTERFLY FIRST, then the signs -- the reverse of
+// build_hadamard_rotate. Applying it here returns the residual stream to the ordinary basis, after which every rotated
+// matmul is handled by build_lora_mm exactly as for any other weight.
+//
+// EVERY lookup into an embedding table goes through here, not only build_inp_embd's: an MTP block embeds its draft
+// token itself (qwen35/qwen35moe/qwen3next), and a drafter embeds with its target's table (xyz, dflash, dspark,
+// gemma4-assistant). The owner is found by pointer, as for weights.
+ggml_tensor * llm_graph_context::build_embd_rows(ggml_tensor * table, ggml_tensor * ids) const {
+    return build_embd_rotation(ggml_get_rows(ctx0, table, ids), table);
+}
+
+ggml_tensor * llm_graph_context::build_embd_rotation(ggml_tensor * cur, const ggml_tensor * table) const {
+    const llama_model * other = cparams.ctx_other != nullptr ? llama_get_model(cparams.ctx_other) : nullptr;
+    const llama_model * m     = nullptr;
+    for (const llama_model * c : { model, other }) {
+        if (c != nullptr && c->had_enabled && c->had_embd != nullptr && c->had_embd == table) {
+            m = c;
+            break;
+        }
+    }
+    if (m == nullptr) {
+        return cur;
+    }
+
+    const auto it_s = m->had_sign_t.find((uint32_t) cur->ne[0]);
+    if (it_s == m->had_sign_t.end()) {
+        GGML_ABORT("hadamard: embedding width %d has no sign vector", (int) cur->ne[0]);
+    }
+
+    cur = build_hadamard_fwht(*m, cur);
+    cur = ggml_mul(ctx0, cur, it_s->second);
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    cur = build_hadamard_rotate(w, cur);
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {
@@ -1728,6 +2043,61 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
+    auto build_down = [&](ggml_tensor * x) {
+        if (down) {
+            x = build_lora_mm(down, x);
+            if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+                // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
+                ggml_mul_mat_set_prec(x, GGML_PREC_F32);
+            }
+        }
+
+        if (down_b) {
+            cb(x, "ffn_down", il);
+        }
+
+        if (down_b) {
+            x = ggml_add(ctx0, x, down_b);
+        }
+
+        if (down_s) {
+            x = ggml_mul(ctx0, x, down_s);
+            cb(x, "ffn_down_s", il);
+        }
+
+        return x;
+    };
+
+    // MERGED GATE+UP. A parallel SiLU gate reads the same activation as up. When the two weights sit back to back in one
+    // buffer (same type and row size -- qwen35 creates them adjacently for this) and see the same rotation
+    // (build_hadamard_rotate caches per input, so equal pointers mean the same nodes), ONE matmul over [gate; up]
+    // replaces two: one activation quantize and fwht less per layer, and one launch of twice the rows. Every output row is
+    // the same dot product and swiglu of the halves is swiglu_split of the two results, so the values are bit-identical.
+    // Only at verify widths (<= 8 columns): wider, the matmul kernels choose their work split from the ROW COUNT, so
+    // [gate; up] would sum in a different order than gate and up apart. gate->ne[1] % 16: the CUDA backend stores PTQ1_0
+    // in 16-row tiles, so [gate; up] reads as ONE matrix only when gate ends on a tile boundary.
+    if (up && gate && gate->type == GGML_TYPE_PTQ1_0 && n_tokens <= 8 && gate->ne[1] % 16 == 0 &&
+            type_gate == LLM_FFN_PAR && type_op == LLM_FFN_SILU && !up_b && !up_s && !gate_b && !gate_s &&
+            !has_lora(up) && !has_lora(gate) && (il < 0 || hparams.swiglu_clamp_shexp[il] <= 1e-6f) &&
+            gate->type == up->type && gate->ne[0] == up->ne[0] && gate->nb[1] == up->nb[1] &&
+            gate->ne[2] == 1 && gate->ne[3] == 1 && up->ne[2] == 1 && up->ne[3] == 1 &&
+            gate->buffer != nullptr && gate->buffer == up->buffer && gate->view_src == nullptr && up->view_src == nullptr &&
+            ggml_is_contiguous(gate) && ggml_is_contiguous(up) &&
+            (const char *) up->data == (const char *) gate->data + ggml_nbytes(gate)) {
+        ggml_tensor * xg = build_hadamard_rotate(gate, cur);
+        if (xg == build_hadamard_rotate(up, cur)) {
+            ggml_tensor * gu = ggml_new_tensor_2d(ctx0, gate->type, gate->ne[0], gate->ne[1] + up->ne[1]);
+            gu->data   = gate->data;     // [gate; up]: both halves are the loaded weights, nothing is copied
+            gu->buffer = gate->buffer;
+            ggml_format_name(gu, "%s+up", ggml_get_name(gate));
+            ggml_tensor * y = ggml_mul_mat(ctx0, gu, xg);
+            cb(y, "ffn_gate_up", il);
+            ggml_tensor * act = ggml_swiglu(ctx0, y);   // silu(first half = gate) * second half (= up)
+            cb(act, "ffn_swiglu", il);
+            return build_down(act);
+        }
+    }
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 
@@ -1867,28 +2237,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(cur, "ffn_gate_par", il);
     }
 
-    if (down) {
-        cur = build_lora_mm(down, cur);
-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
-            // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
-            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
-        }
-    }
-
-    if (down_b) {
-        cb(cur, "ffn_down", il);
-    }
-
-    if (down_b) {
-        cur = ggml_add(ctx0, cur, down_b);
-    }
-
-    if (down_s) {
-        cur = ggml_mul(ctx0, cur, down_s);
-        cb(cur, "ffn_down_s", il);
-    }
-
-    return cur;
+    return build_down(cur);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
@@ -2308,7 +2657,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    // THE EARLY VERIFY: rows 1..vchain_n of this verify are the draws of a device draft chain that
+    // may still be running; only row 0, the last sampled token, is looked up from its token (llama_verify_chain_arm)
+    const bool vc = vchain != nullptr && ubatch.token != nullptr && ubatch.n_tokens == (uint32_t) vchain_n + 1;
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, vc ? 1 : ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
@@ -2325,9 +2678,23 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        // Only the TOKEN path is un-rotated: inps[1] below is a caller-supplied embedding, which
+        // arrives in the ordinary basis and must not be touched.
+        if (vc) {
+            // the drawn columns (each record's [3]) index the draft vocabulary's rows of THIS token table, copied in its
+            // own type (llama_context::draft_chain_init), so each row dequantizes as the host lookup does. The rows join
+            // row 0 BEFORE the rotation, which works row by row: the verify's input is the one the host would build. The
+            // host lookup stays the graph's first node, so its split runs before any device work of this verify.
+            ggml_tensor * cols = ggml_cont(ctx0, ggml_view_2d(ctx0, vchain->rec, 1, vchain_n, vchain->rec->nb[1],
+                                                              3*sizeof(int32_t)));
+            ggml_tensor * row0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+            ggml_tensor * rows = ggml_get_rows(ctx0, vchain->embd, ggml_reshape_1d(ctx0, cols, vchain_n));
+            cur = build_embd_rotation(ggml_concat(ctx0, row0, rows, 1), tok_embd);
+        } else {
+            cur = build_embd_rows(tok_embd, inp->tokens);
+        }
 
-        // apply lora for embedding tokens if needed
+        // apply lora for embedding tokens if needed (never with vc: llama_verify_chain_arm refuses under LoRA)
         for (const auto & lora : *loras) {
             llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
             if (lw == nullptr) {
@@ -2579,9 +2946,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        // RESTORED: the xyzkv patch deleted these two lines. They are OURS (n_kv_max is a
+        // local parameter the upstream fork does not have), and they sat inside the same
+        // hunk as the xyzkv addition below, so a hunk filter that keeps a hunk because
+        // its ADDITIONS mention xyzkv will carry its unrelated DELETIONS along with it.
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        // xyzkv: inverse WHT on FA output when V values are WHT-rotated.
+        // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
+        // Group size must come from K (which determines the WHT rotation), not V.
+        if (xyzkv_is_rotated_kv(v)) {
+            const bool k_is_xyzkv = (xyzkv_is_rotated_kv(k));
+            const ggml_tensor * group_src = k_is_xyzkv ? k : v;
+            const int xyzkv_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (cur->ne[0] % xyzkv_group == 0) {
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                ggml_tensor * innerq_scale = mctx ? mctx->get_xyzkv_innerq_scale_inv() : nullptr;
+                cur = ggml_xyzkv_wht(ctx0, cur, 1, xyzkv_group, innerq_scale);  // 1 = inverse
+            }
+        }
 
         if (v_mla) {
 #if 0
@@ -2648,6 +3033,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
+
+        // xyzkv: inverse WHT on attention output (non-FA path)
+        if (xyzkv_is_rotated_kv(v)) {
+            const bool k_is_xyzkv = (xyzkv_is_rotated_kv(k));
+            const ggml_tensor * group_src = k_is_xyzkv ? k : v;
+            const int xyzkv_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (kqv->ne[0] % xyzkv_group == 0) {
+                if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
+                ggml_tensor * innerq_scale = mctx ? mctx->get_xyzkv_innerq_scale_inv() : nullptr;
+                kqv = ggml_xyzkv_wht(ctx0, kqv, 1, xyzkv_group, innerq_scale);
+            }
+        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
@@ -2733,6 +3130,31 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
+    // xyzkv: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=xyzkv
+    if (xyzkv_is_rotated_kv(v)) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
+            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
+            // count check in ggml_reshape_3d.
+            const int64_t n_head_v = hparams.n_head(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
+
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
     }
@@ -2763,7 +3185,35 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        if (cparams.flash_attn && mctx_cur->kq_mask_pos_ok(ubatch, cparams.causal_attn)) {
+            // POSITIONAL KQ MASK (> 16 rows): llama_kv_cache::build_kq_mask_pos. The device mask's inputs, and the attention
+            // reads [qpos | kpos] instead of an n_kv x rows table (160 MiB at 160k and a 512-token batch).
+            const int64_t nupd = mctx_cur->kq_mask_dev_nupd();
+            inp->kq_dev_idx  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nupd);
+            inp->kq_dev_val  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, nupd);
+            inp->kq_dev_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
+            ggml_set_input(inp->kq_dev_idx);
+            ggml_set_input(inp->kq_dev_val);
+            ggml_set_input(inp->kq_dev_rows);
+            inp->self_kq_mask = mctx_cur->build_kq_mask_pos(ctx0, inp->kq_dev_idx, inp->kq_dev_val, inp->kq_dev_rows);
+            ggml_set_name(inp->self_kq_mask, "attn_inp_kq_mask_pos");
+            inp->kq_pos = true;
+        } else if (mctx_cur->kq_mask_dev_ok(ubatch, cparams.causal_attn)) {
+            // DEVICE KQ MASK: llama_kv_cache::build_kq_mask_dev. Inputs: the changed cells (a
+            // 64-entry bucket in steady state) and the rows' positions -- instead of the n_kv x rows mask itself.
+            const int64_t nupd = mctx_cur->kq_mask_dev_nupd();
+            inp->kq_dev_idx  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nupd);
+            inp->kq_dev_val  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, nupd);
+            inp->kq_dev_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
+            ggml_set_input(inp->kq_dev_idx);
+            ggml_set_input(inp->kq_dev_val);
+            ggml_set_input(inp->kq_dev_rows);
+            inp->self_kq_mask = mctx_cur->build_kq_mask_dev(ctx0, inp->kq_dev_idx, inp->kq_dev_val, inp->kq_dev_rows,
+                                                            cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            ggml_set_name(inp->self_kq_mask, "attn_inp_kq_mask_dev");
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        }
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -2796,6 +3246,10 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    const auto * mctx_cur = inp->mctx;
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
@@ -2805,32 +3259,72 @@ ggml_tensor * llm_graph_context::build_attn(
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
-    // these nodes are added to the graph together so that they are not reordered
-    // by doing so, the number of splits in the graph is reduced
-    // expand k later to enable rope fusion which directly writes into k-v cache
-    ggml_build_forward_expand(gf, q_cur);
-    ggml_build_forward_expand(gf, v_cur);
-    ggml_build_forward_expand(gf, k_cur);
+    ggml_tensor * q = q_cur;
 
-    const auto * mctx_cur = inp->mctx;
+    // xyzkv pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    if (xyzkv_is_rotated_kv(k)) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_xyzkv_innerq_scale_inv();
+        q = ggml_xyzkv_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
+
+    // each chain CONTIGUOUS in the graph -- Q through its xyzkv WHT, then V through its cache
+    // store, then K through its cache store -- so the CUDA backend can run each chain as one launch (a fused kernel may
+    // only claim adjacent nodes: an output written early must not land on anything live in between). Node order only;
+    // the chains are independent, so numerically identical. (Was: q, v, k, then both stores, then Q's xyzkv WHT.)
+    ggml_build_forward_expand(gf, q);
 
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, v_cur);
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, k_cur);
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // the positional mask is a vector, not a table: only flash attention (no KQ bias) may consume it
+    GGML_ASSERT(!inp->kq_pos || (cparams.flash_attn && kq_b == nullptr));
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // xyzkv: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=xyzkv
+    if (xyzkv_is_rotated_kv(v)) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
+            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
+            // count check in ggml_reshape_3d.
+            const int64_t n_head_v = hparams.n_head(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
@@ -2918,10 +3412,49 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    // xyzkv pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    if (xyzkv_is_rotated_kv(k)) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_xyzkv_innerq_scale_inv();
+        q = ggml_xyzkv_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // xyzkv: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=xyzkv
+    if (xyzkv_is_rotated_kv(v)) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
+            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
+            // count check in ggml_reshape_3d.
+            const int64_t n_head_v = hparams.n_head(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
@@ -3003,10 +3536,49 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    // xyzkv pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    if (xyzkv_is_rotated_kv(k)) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_xyzkv_innerq_scale_inv();
+        q = ggml_xyzkv_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // xyzkv: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=xyzkv
+    if (xyzkv_is_rotated_kv(v)) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
+            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
+            // count check in ggml_reshape_3d.
+            const int64_t n_head_v = hparams.n_head(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
@@ -3082,10 +3654,49 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    // xyzkv pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    if (xyzkv_is_rotated_kv(k)) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_xyzkv_innerq_scale_inv();
+        q = ggml_xyzkv_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // xyzkv: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=xyzkv
+    if (xyzkv_is_rotated_kv(v)) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
+            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
+            // count check in ggml_reshape_3d.
+            const int64_t n_head_v = hparams.n_head(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
@@ -3153,10 +3764,49 @@ ggml_tensor * llm_graph_context::build_attn(
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    // xyzkv pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    if (xyzkv_is_rotated_kv(k)) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_xyzkv_innerq_scale_inv();
+        q = ggml_xyzkv_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // xyzkv: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=xyzkv
+    if (xyzkv_is_rotated_kv(v)) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
+            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
+            // count check in ggml_reshape_3d.
+            const int64_t n_head_v = hparams.n_head(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (k_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, k_rot);
@@ -3216,6 +3866,31 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // xyzkv: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=xyzkv
+    if (xyzkv_is_rotated_kv(v)) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
+            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
+            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
+            // count check in ggml_reshape_3d.
+            const int64_t n_head_v = hparams.n_head(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
@@ -3462,6 +4137,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->rs_mode = mctx_cur->get_rs_mode();
+    if (inp->rs_mode != 0) {
+        inp->prefix_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+        ggml_set_input(inp->prefix_n);
+        inp->conv_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mctx_cur->get_conv_window(), n_seqs);
+        ggml_set_input(inp->conv_idx);
+    }
 
     return inp;
 }
@@ -3704,6 +4386,30 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+// THE LOGITS PREFILTER: each output row's top-k ids and their
+// logits, so the host copies k (id, logit) pairs per row instead of the whole vocabulary. The ids come in no order (and
+// ties at the k-th value in no defined order): the sampler re-ranks them exactly (common_topk_scan::run_mapped, ties by
+// id) and falls back to the full row -- still on the device -- whenever the prefilter could have changed its answer.
+// t_logits stays an output, so its rows survive the graph for that fallback.
+void llm_graph_context::build_logits_topk() const {
+    ggml_tensor * logits = res->t_logits;
+    if (logits_topk <= 0 || logits == nullptr || logits->type != GGML_TYPE_F32 || logits->ne[0] <= logits_topk ||
+            ggml_nrows(logits) < 1 || !ggml_is_contiguous(logits)) {
+        return;
+    }
+    ggml_tensor * ids = ggml_top_k(ctx0, logits, logits_topk);                                   // [k, n_rows] I32
+    ggml_set_name(ids, "logits_topk_ids");
+    ggml_tensor * rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], ggml_nrows(logits));  // [1, n_vocab, n_rows]
+    ggml_tensor * val  = ggml_get_rows(ctx0, rows, ids);                                        // [1, k, n_rows]
+    ggml_set_name(val, "logits_topk_val");
+    ggml_set_output(ids);
+    ggml_set_output(val);
+    ggml_build_forward_expand(gf, ids);
+    ggml_build_forward_expand(gf, val);
+    res->t_logits_topk_ids = ids;
+    res->t_logits_topk_val = val;
 }
 
 void llm_graph_context::build_sampling() const {

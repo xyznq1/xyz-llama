@@ -95,6 +95,11 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+// Fuse the device KQ mask chain REPEAT(pos) -> SUB(rows) -> NEG -> STEP -> LOG -> CPY(f16) in one
+// launch, written to cpy. false = shapes not handled (nothing launched).
+bool ggml_cuda_op_kq_mask_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * repeat, const ggml_tensor * sub,
+                                ggml_tensor * cpy);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

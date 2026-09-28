@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_XYZKV2_0 = 43, // xyzkv 2-bit KV cache: WHT + 2-bit PolarQuant
+        GGML_TYPE_PQ2_0   = 142, // PrismML 2-bit, group 128: 2 + 32 B per 128 weights, 2.125 bpw
+        GGML_TYPE_PTQ1_0  = 143, // PrismML ternary, group 128: 1.75 bpw
+        GGML_TYPE_COUNT   = 144,
     };
 
     // precision
@@ -574,6 +577,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_XYZKV_WHT,
+        GGML_OP_DRAFT_SAMPLE,
 
         GGML_OP_UNARY,
 
@@ -2609,6 +2614,67 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // Prefix replay for speculative decoding on recurrent layers.
+    // Before the batch tokens, replay n_prev earlier tokens whose q,k,v,g,beta are packed per
+    // (seq, token) in `prefix` [pack_row, n_prev, n_seqs] (row layout: ggml_gated_delta_net_pack_row),
+    // starting from `state`. GGML_GDN_COMMIT_AFTER_PREFIX makes the output state the state after
+    // the prefix -- a speculative round's COMMITTED state -- while the batch tokens only produce
+    // attention outputs; that is what lets the recurrent cache hold one row per sequence instead of
+    // 1 + n_draft snapshot planes. GGML_GDN_WRITE_PACK appends the batch tokens' own q,k,v,g,beta,
+    // packed the same way, so they can be next round's prefix.
+    // Output: [attn S_v*H*n_tokens*n_seqs | state K*S_v*S_v*H*n_seqs | pack (if requested)].
+    // K must be 1 when a prefix is given. prefix may be NULL (n_prev = 0).
+    enum ggml_gdn_flags {
+        GGML_GDN_COMMIT_AFTER_PREFIX = 1,
+        GGML_GDN_WRITE_PACK          = 2,
+    };
+    GGML_API int64_t ggml_gated_delta_net_pack_row(int64_t S_k, int64_t H_k, int64_t S_v, int64_t H_v, bool kda);
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * prefix,
+            struct ggml_tensor  * prefix_n, // I32 [n_seqs]: rows of `prefix` each sequence replays (NULL = prefix->ne[1] for all)
+            int64_t               K,
+            int32_t               flags);
+
+    // xyzkv Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
+    // Applies WHT rotation to 128-element groups along ne[0]: sign1 -> butterfly -> sign2 -> normalize
+    // direction: 0 = forward (signs1 -> WHT -> signs2), 1 = inverse (signs2 -> WHT -> signs1)
+    GGML_API struct ggml_tensor * ggml_xyzkv_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction,
+            int                   group_size,    // 0 = auto (64 or 128 from ne[0])
+            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // One row of draft logits produces the coupled draw of the speculative drafter's chain.
+    // (top_k -> softmax -> top_p -> softmax -> shared-noise Gumbel-max), in the exact order of the CPU samplers.
+    //   logits  F32 [n_col]    one output row (compact: column c is token col_ids[c])
+    //   col_ids I32 [n_col]    column -> token id
+    //   key     I32 [2]        the coupled key (llama_sampler_coupled_key) as two 32-bit halves, low first
+    // result I32 [GGML_DRAFT_SAMPLE_OUT]: [0] selected id, [1] n kept, [2] spare (2nd id or -1), [3] the selected
+    //   id's COLUMN, then top_k ids, top_k logits (f32 bits), top_k p (f32 bits, the dist's renormalised p)
+    // Optional side outputs, for a draft chain that runs with no host in between (all persistent tensors):
+    //   step I32 [1] + rec I32 [GGML_DRAFT_SAMPLE_OUT, n]: the result is also written to rec row step[0]
+    //   col  I32 [1]: the selected column, for the next step's embedding lookup
+    #define GGML_DRAFT_SAMPLE_MAX_K 32
+    #define GGML_DRAFT_SAMPLE_OUT   (4 + 3*GGML_DRAFT_SAMPLE_MAX_K)
+    GGML_API struct ggml_tensor * ggml_draft_sample(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * col_ids,
+            struct ggml_tensor  * key,
+            struct ggml_tensor  * step,    // NULL = no record
+            struct ggml_tensor  * rec,     // NULL = no record
+            struct ggml_tensor  * col,     // NULL = no column output
+            int                   top_k,
+            float                 top_p);
 
     // DSA lightning indexer
     //

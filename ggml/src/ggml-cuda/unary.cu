@@ -719,3 +719,40 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+        /* device KQ mask chain */
+
+// This kernel evaluates SUB -> NEG -> STEP -> LOG -> CPY(f16) in the same operation order as the mask graph.
+static __global__ void kq_mask_chain_f16_kernel(const float * __restrict__ pos, const float * __restrict__ rows,
+                                                half * __restrict__ dst, const int64_t n_kv, const int n_rows) {
+    const int64_t j = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    ggml_cuda_pdl_sync();
+    if (j >= n_kv) {
+        return;
+    }
+    const float p = pos[j];
+    for (int r = 0; r < n_rows; ++r) {
+        dst[(int64_t) r*n_kv + j] = __float2half(op_log(op_step(op_neg(p - rows[r]))));
+    }
+}
+
+bool ggml_cuda_op_kq_mask_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * repeat, const ggml_tensor * sub,
+                                ggml_tensor * cpy) {
+    const ggml_tensor * pos  = repeat->src[0];
+    const ggml_tensor * rows = sub->src[1];
+    const int64_t n_kv   = repeat->ne[0];
+    const int64_t n_rows = repeat->ne[1];
+    if (pos->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_F32 || repeat->type != GGML_TYPE_F32 ||
+            sub->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F16 ||
+            ggml_nelements(pos) != n_kv || pos->ne[0] != n_kv || !ggml_is_contiguous(pos) ||
+            repeat->ne[2] != 1 || repeat->ne[3] != 1 || n_rows < 1 || n_rows > 16 ||
+            rows->ne[0] != 1 || rows->ne[1] != n_rows || ggml_nelements(rows) != n_rows || !ggml_is_contiguous(rows) ||
+            !ggml_are_same_shape(sub, repeat) || !ggml_are_same_shape(cpy, repeat) || !ggml_is_contiguous(cpy)) {
+        return false;
+    }
+    constexpr int bs = 256;
+    const ggml_cuda_kernel_launch_params lp(dim3((unsigned) ((n_kv + bs - 1) / bs), 1, 1), dim3(bs, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(kq_mask_chain_f16_kernel, lp, (const float *) pos->data, (const float *) rows->data,
+        (half *) cpy->data, n_kv, (int) n_rows);
+    return true;
+}

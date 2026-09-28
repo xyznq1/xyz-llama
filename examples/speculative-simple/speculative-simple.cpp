@@ -233,7 +233,7 @@ int main(int argc, char ** argv) {
             llama_decode(ctx_tgt, batch_tgt);
         }
 
-        // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.
+        // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Xyz, etc.
         if (!common_speculative_process(spec, batch_tgt)) {
             LOG_ERR("%s", "failed to process speculative batch\n");
             break;

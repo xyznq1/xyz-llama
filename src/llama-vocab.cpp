@@ -2233,7 +2233,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN2;
                 clean_spaces = false;
             } else if (
-                    tokenizer_pre == "qwen35") {
+                    tokenizer_pre == "qwen35" ||
+                    tokenizer_pre == "xyz_248320") {   // the xyz drafter's id for the same 248,320-token vocabulary
                 pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN35;
                 clean_spaces = false;
             } else if (

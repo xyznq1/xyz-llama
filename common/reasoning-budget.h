@@ -43,6 +43,9 @@ struct llama_sampler * common_reasoning_budget_init(
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
 
+// xyz-engine: the tokens left in the current reasoning block (COUNTING) and, in *budget, the block's budget
+int32_t common_reasoning_budget_get_remaining(const struct llama_sampler * smpl, int32_t * budget);
+
 // The end sequence that transitioned the sampler to DONE, or nullptr if none
 // was recorded. Cleared when a new start sequence re-arms the sampler.
 const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);

@@ -25,6 +25,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   rs_pack_tokens,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -59,6 +60,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         rs_size,
         n_seq_max,
         n_rs_seq,
+        rs_pack_tokens,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
@@ -140,6 +142,10 @@ void llama_memory_hybrid::clear(bool data) {
     mem_recr->clear(data);
 }
 
+void llama_memory_hybrid::pos_dev_invalidate() {
+    mem_attn->pos_dev_invalidate();
+}
+
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
@@ -157,6 +163,10 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
+}
+
+void llama_memory_hybrid::rs_set_prefix(llama_seq_id seq_id, int32_t n_prev) {
+    mem_recr->rs_set_prefix(seq_id, n_prev);
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -268,6 +278,18 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_xyzkv_rot_forward() const {
+    return ctx_attn ? ctx_attn->get_xyzkv_rot_forward() : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_xyzkv_rot_inverse() const {
+    return ctx_attn ? ctx_attn->get_xyzkv_rot_inverse() : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_xyzkv_innerq_scale_inv() const {
+    return ctx_attn ? ctx_attn->get_xyzkv_innerq_scale_inv() : nullptr;
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {

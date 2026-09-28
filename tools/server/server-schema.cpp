@@ -194,13 +194,16 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
+    // The draft LENGTH per request: the README documented this field while the whole block below was
+    // compiled out, so a request's value was silently ignored. Only n_max is enabled: it can only shorten the draft (the
+    // drafter's buffers -- the device chain's record rows -- are sized for the server's own --spec-draft-n-max), and a
+    // request without it keeps the server's value (params.speculative starts as params_base.speculative).
+    add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+        ->set_hard_limits(0, params_base.speculative.draft.n_max)
+        ->set_desc("Maximum number of tokens to draft during speculative decoding (at most the server's --spec-draft-n-max)"));
+
     // TODO: to keep things simple, we disable speculative parameter adjustments for now
 #if 0
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
-    add((new field_num("speculative.n_max", params.speculative.draft.n_max))
-        ->set_hard_limits(0, INT32_MAX)
-        ->set_desc("Maximum number of tokens to draft during speculative decoding"));
-
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Minimum number of draft tokens to use for speculative decoding");

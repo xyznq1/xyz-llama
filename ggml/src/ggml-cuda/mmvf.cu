@@ -27,7 +27,7 @@ static __global__ void mul_mat_vec_f(
 
     ggml_cuda_pdl_sync();
     if constexpr (is_multi_token_id) {
-        // Multi-token MUL_MAT_ID path, adding these in the normal path causes a perf regression for n_tokens=1 case
+        // Multi-token MUL_MAT_ID uses blockIdx.z for the token index.
         token_idx  = blockIdx.z;
         channel_x  = ids[channel_dst + token_idx * ids_stride];
         channel_y  = fastmodulo(channel_dst, nchannels_y);
@@ -803,6 +803,13 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
         if (src0_nb[i] % (2*ts) != 0) {
             return false;
+        }
+    }
+
+    if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+        // Small output dimensions are launch-bound, so use the vector kernel at its supported widths.
+        if (src0_ne[1] <= 512) {
+            return ne11 <= 8;
         }
     }
 

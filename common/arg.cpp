@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <filesystem>
+#include <random>
 #include <fstream>
 #include <list>
 #include <numeric>
@@ -311,6 +312,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_XYZKV2_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -371,9 +373,9 @@ common_models_handler common_models_handler_init(const common_params & params, l
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
 
-    const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
+    const bool spec_type_draft_xyz = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
-                                           COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params.speculative.types.end();
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_XYZ) != params.speculative.types.end();
 
     const bool spec_type_draft_dspark = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -391,7 +393,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     opts.bearer_token    = params.hf_token;
     opts.offline         = params.offline;
     opts.download_mtp    = spec_type_draft_mtp;
-    opts.download_eagle3 = spec_type_draft_eagle3;
+    opts.download_xyz = spec_type_draft_xyz;
     opts.download_dflash = spec_type_draft_dflash;
     opts.download_dspark = spec_type_draft_dspark;
     opts.download_mmproj = use_mmproj && !params.no_mmproj
@@ -407,7 +409,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
         if (spec_types_is_default(params)) {
             opts_spec.download_mtp    = true;
             opts_spec.download_dflash = true;
-            opts_spec.download_eagle3 = true;
+            opts_spec.download_xyz = true;
             opts_spec.download_dspark = true;
         }
         plan_spec = common_download_get_hf_plan(params.speculative.draft.mparams, opts_spec);
@@ -536,7 +538,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     if (!params.speculative.draft.mparams.hf_file.empty()) {
         plan_spec.mtp    = {};
         plan_spec.dflash = {};
-        plan_spec.eagle3 = {};
+        plan_spec.xyz = {};
         plan_spec.dspark = {};
     }
 
@@ -546,17 +548,17 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             plan_spec.dspark = {};
             plan_spec.dflash = {};
-            plan_spec.eagle3 = {};
+            plan_spec.xyz = {};
         } else if (!plan_spec.dspark.local_path.empty()) {
             // dspark outranks dflash, its sidecar carries the extra Markov head
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
             plan_spec.dflash = {};
-            plan_spec.eagle3 = {};
+            plan_spec.xyz = {};
         } else if (!plan_spec.dflash.local_path.empty()) {
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
-            plan_spec.eagle3 = {};
-        } else if (!plan_spec.eagle3.local_path.empty()) {
-            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 };
+            plan_spec.xyz = {};
+        } else if (!plan_spec.xyz.local_path.empty()) {
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_XYZ };
         }
     }
 
@@ -572,7 +574,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
     const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
                                     !plan_spec.dflash.local_path.empty() ||
-                                    !plan_spec.eagle3.local_path.empty() ||
+                                    !plan_spec.xyz.local_path.empty() ||
                                     !plan_spec.dspark.local_path.empty();
     if (!plan_spec.mtp.local_path.empty() && !had_spec_url) {
         tasks.emplace_back(plan_spec.mtp, opts, [&]() {
@@ -594,13 +596,13 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             }
         });
     }
-    if (!plan_spec.eagle3.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan_spec.eagle3, opts, [&]() {
-            // only use the discovered Eagle3 sidecar when no draft path is set yet
+    if (!plan_spec.xyz.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan_spec.xyz, opts, [&]() {
+            // only use the discovered Xyz sidecar when no draft path is set yet
             if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.eagle3);
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.xyz);
             } else {
-                hf_cache::finalize_file(plan_spec.eagle3);
+                hf_cache::finalize_file(plan_spec.xyz);
             }
         });
     }
@@ -654,13 +656,13 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             }
         });
     }
-    if (!plan.eagle3.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan.eagle3, opts, [&]() {
-            // only fall back to the discovered Eagle3 sidecar when no draft was explicitly provided
+    if (!plan.xyz.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan.xyz, opts, [&]() {
+            // only fall back to the discovered Xyz sidecar when no draft was explicitly provided
             if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.eagle3);
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.xyz);
             } else {
-                hf_cache::finalize_file(plan.eagle3);
+                hf_cache::finalize_file(plan.xyz);
             }
         });
     }
@@ -3122,10 +3124,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
-        {"--eagle3"},
-        "also download the Eagle3 sidecar, if available (default: unused)",
+        {"--xyz"},
+        "also download the Xyz sidecar, if available (default: unused)",
         [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
+            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_XYZ);
         }
     ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
@@ -4265,6 +4267,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(common_arg(
+        {"--spec-coupled"},
+        {"--no-spec-coupled"},
+        string_format("couple drafter and target selection with shared Gumbel noise, so a draft is "
+                      "accepted whenever the two distributions agree rather than only when two "
+                      "independent draws collide (default: %s)",
+                      params.speculative.draft.coupled ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.coupled = value;
+
+            if (value) {
+                // One stream shared by both sides. Deliberately NOT either sampler's own seed:
+                // those are randomised independently per sampler and would never match.
+                if (params.speculative.draft.coupled_seed == 0) {
+                    params.speculative.draft.coupled_seed =
+                        params.sampling.seed != LLAMA_DEFAULT_SEED
+                            ? params.sampling.seed
+                            : (uint32_t) std::random_device{}();
+                }
+
+                // The coupled selector currently exists only in the CPU sampler. With backend
+                // sampling the target selects inside the compute graph and never runs it, so the
+                // two sides would silently decouple and acceptance would fall below baseline.
+                if (params.sampling.backend_sampling) {
+                    LOG_WRN("%s: --spec-coupled disables backend sampling for the target "
+                            "(the coupled selector is CPU-only)\n", __func__);
+                    params.sampling.backend_sampling = false;
+                }
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_COUPLED"));
+    add_opt(common_arg(
+        {"--spec-rejection"},
+        {"--no-spec-rejection"},
+        string_format("verify sampled drafts losslessly against the drafter's recorded proposals (block verification: "
+                      "the longest acceptable draft prefix is kept, every token an exact sample of the target) instead of "
+                      "the shared-noise agreement; needs --spec-coupled and a sampling request (default: %s)",
+                      params.speculative.draft.rejection ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.rejection = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_REJECTION"));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),

@@ -1602,6 +1602,11 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         goto done;
     }
 
+    if (llama_rs_replay(ctx)) {
+        COM_TRC("%s", "the context rolls recurrent state back by prefix replay\n");
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS_REPLAY;
+        goto done;
+    }
     if (llama_n_rs_seq(ctx) > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
         res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
@@ -1722,6 +1727,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.rs_replay         = true;   // roll recurrent state back by replaying the kept tokens: no snapshot planes
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

@@ -168,6 +168,16 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // xyz-engine binding: each model layer's K/V tensor (stream 0) into k[il]/v[il] (il < n)
+    void engine_tensors(const ggml_tensor ** k, const ggml_tensor ** v, int n) const;
+    uint32_t engine_head() const { return v_heads.empty() ? 0 : v_heads[0]; }
+    // xyz-engine hand-over (llama_engine_kv_set_table / llama_engine_kv_commit)
+    bool engine_set_table(const int32_t * pos, int32_t n, uint32_t head);
+    bool engine_commit(int32_t p0, int32_t p1);
+
+    // RESTORED: the xyzkv patch deleted this declaration. It is OURS - the upstream fork has
+    // no state_read_sinfo - and it shared a hunk with the xyzkv additions below, so the
+    // filter kept the hunk for its additions and took the deletion with it.
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
@@ -178,6 +188,15 @@ public:
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
     const slot_info_vec_t *   sinfos_in);
+
+    // xyzkv: get rotation matrices (stored as row-major C arrays)
+    // xyzkv_rotation = R (forward rotation, for Q pre-rotate-queries)
+    // xyzkv_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)
+    ggml_tensor * get_xyzkv_rotation() const { return xyzkv_rotation; }
+    ggml_tensor * get_xyzkv_rotation_inv() const { return xyzkv_rotation_inv; }
+
+    // xyzkv InnerQ: per-channel scale_inv for Q/V equalization
+    ggml_tensor * get_xyzkv_innerq_scale_inv() const { return xyzkv_innerq_scale_inv; }
 
     //
     // graph_build API
@@ -228,6 +247,28 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // DEVICE KQ MASK: the mask built on the device from pos_dev, for small single-
+    // sequence ubatches (the verify) where set_input_kq_mask wrote n_kv x n_tokens values on the host (~0.2 ms at 151k)
+    // and the scheduler uploaded them (1.5 MB) with the GPU waiting.
+    //   kq_mask_dev_ok    -- the ubatch qualifies (the same condition as the host fast path, plus <= 16 rows)
+    //   kq_mask_dev_nupd  -- the update bucket the graph needs for the cells changed since the last device mask
+    //   build_kq_mask_dev -- the graph part: scatter the changed cells into pos_dev, then 0 / -inf per (cell, row)
+    //   set_input_kq_mask_dev -- the changed cells and the row positions, into the graph's small inputs
+    bool          kq_mask_dev_ok  (const llama_ubatch & ubatch, bool causal_attn) const;
+    uint32_t      kq_mask_dev_nupd() const;
+    void          pos_dev_invalidate() override;   // after a failed compute: the next device mask uploads every cell
+    ggml_tensor * build_kq_mask_dev(ggml_context * ctx, ggml_tensor * upd_idx, ggml_tensor * upd_val, ggml_tensor * rows,
+                                    uint32_t n_kv, ggml_type type) const;
+    void          set_input_kq_mask_dev(ggml_tensor * upd_idx, ggml_tensor * upd_val, ggml_tensor * rows,
+                                        const llama_ubatch * ubatch) const;
+    // POSITIONAL KQ MASK: the same inputs for batches of MORE than 16 tokens, where the host built an n_kv x rows
+    // table (160 MiB at 160k and a 512-token batch). The attention reads [qpos | kpos] instead (ggml_flash_attn_ext).
+    //   kq_mask_pos_ok    -- the device mask's condition for > 16 rows; an empty cache (the scheduler's reserve) qualifies
+    //   build_kq_mask_pos -- scatter the changed cells into pos_dev, then the F32 vector [rows' p + 0.5 | cells' positions]
+    bool          kq_mask_pos_ok  (const llama_ubatch & ubatch, bool causal_attn) const;
+    ggml_tensor * build_kq_mask_pos(ggml_context * ctx, ggml_tensor * upd_idx, ggml_tensor * upd_val, ggml_tensor * rows,
+                                    uint32_t n_kv) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -282,6 +323,20 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // device copies of attn_rot_hadamard, uploaded once at load: the graph references these instead of graph inputs,
+    // which re-uploaded 2 x 256 KB of constants on EVERY compute (upstream's own TODO; measured as two
+    // 262,144-byte HtoD copies per xyz2 draft step). Empty when no_alloc or the cache has no layers.
+    ggml_context_ptr        ctx_rot_dev;
+    ggml_backend_buffer_ptr buf_rot_dev;
+    std::unordered_map<int64_t, ggml_tensor *> attn_rot_dev;
+
+    // the cells' positions mirrored on the device (DEVICE KQ MASK): F32 [size + 1], an empty cell +inf, the last
+    // element a scratch cell that padded updates write. Kept current by the graphs that read it (set_rows of the cells
+    // llama_kv_cells::pos_dirty lists). nullptr for a multi-stream cache or when nothing is allocated.
+    ggml_context_ptr        ctx_pos_dev;
+    ggml_backend_buffer_ptr buf_pos_dev;
+    ggml_tensor *           pos_dev = nullptr;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -309,6 +364,13 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // xyzkv rotation matrices (128x128, row-major stored)
+    ggml_tensor * xyzkv_rotation = nullptr;      // R (forward rotation)
+    ggml_tensor * xyzkv_rotation_inv = nullptr;   // R^T = R^{-1} (inverse rotation)
+
+    // xyzkv InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
+    ggml_tensor * xyzkv_innerq_scale_inv = nullptr;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -398,6 +460,17 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    // xyzkv rotation accessors
+    ggml_tensor * get_xyzkv_rotation() const;
+    ggml_tensor * get_xyzkv_rotation_inv() const;
+
+    // Override virtual methods from llama_memory_context_i
+    ggml_tensor * get_xyzkv_rot_forward() const override;
+    ggml_tensor * get_xyzkv_rot_inverse() const override;
+
+    // xyzkv InnerQ: per-channel scale_inv for Q/V equalization
+    ggml_tensor * get_xyzkv_innerq_scale_inv() const override;
+
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
@@ -422,6 +495,17 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // see llama_kv_cache: the DEVICE KQ MASK, over this context's n_kv cells
+    bool          kq_mask_dev_ok  (const llama_ubatch & ubatch, bool causal_attn) const;
+    uint32_t      kq_mask_dev_nupd() const;
+    ggml_tensor * build_kq_mask_dev(ggml_context * ctx, ggml_tensor * upd_idx, ggml_tensor * upd_val, ggml_tensor * rows,
+                                    ggml_type type) const;
+    void          set_input_kq_mask_dev(ggml_tensor * upd_idx, ggml_tensor * upd_val, ggml_tensor * rows,
+                                        const llama_ubatch * ubatch) const;
+    // ... and the POSITIONAL KQ MASK (> 16 rows), over this context's n_kv cells
+    bool          kq_mask_pos_ok  (const llama_ubatch & ubatch, bool causal_attn) const;
+    ggml_tensor * build_kq_mask_pos(ggml_context * ctx, ggml_tensor * upd_idx, ggml_tensor * upd_val, ggml_tensor * rows) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

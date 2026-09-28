@@ -44,6 +44,9 @@ int server_queue::post(server_task && task, bool front) {
         time_last_task = ggml_time_ms();
     }
     condition_tasks.notify_one();
+    if (worker.yielding) {
+        worker.cv.notify_one(); // the worker serves tasks while a yield runs; it waits on its own cv
+    }
     return task_id;
 }
 
@@ -70,6 +73,9 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         time_last_task = ggml_time_ms();
     }
     condition_tasks.notify_one();
+    if (worker.yielding) {
+        worker.cv.notify_one();
+    }
     return 0;
 }
 
@@ -110,6 +116,9 @@ void server_queue::pop_deferred_task(int id_slot) {
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
+    if (worker.yielding) {
+        worker.cv.notify_one();
+    }
 }
 
 void server_queue::wait_until_no_sleep() {
@@ -161,48 +170,44 @@ bool server_queue::process_new_tasks(bool is_yielding) {
 }
 
 void server_queue::worker_loop() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
     while (true) {
-        {
-            std::unique_lock<std::mutex> lock(mutex_tasks);
-            // wait on busy instead of yielding - busy stays set even when the yield already ended
-            worker.cv.wait(lock, [&]{
-                return worker.stop || worker.busy;
-            });
-            if (worker.stop) {
-                return;
-            }
+        // sleep until a yield is running AND has a task for us: yield_to_queue() wakes us for tasks already queued,
+        // post() for later ones. A task is only ever taken while `yielding` holds under this lock, so none starts
+        // after the yield ended -- and the end of the yield waits for the one in flight (in_task), if any.
+        worker.cv.wait(lock, [&]{
+            return worker.stop || (worker.yielding && running && !worker.failed && !queue_tasks.empty());
+        });
+        if (worker.stop) {
+            return;
         }
 
-        // process tasks while the yield is active
-        while (true) {
-            bool terminated = false;
-            try {
-                // note: do not hold any lock here, the callback may post new tasks
-                terminated = process_new_tasks(true);
-            } catch (...) {
-                std::unique_lock<std::mutex> lock(mutex_tasks);
-                worker.exception = std::current_exception();
-                break;
-            }
+        server_task task = std::move(queue_tasks.front());
+        queue_tasks.pop_front();
+        worker.in_task = true;
+        lock.unlock();
 
-            std::unique_lock<std::mutex> lock(mutex_tasks);
-            if (terminated || worker.stop || !worker.yielding) {
-                break;
-            }
-            if (!queue_tasks.empty()) {
-                continue; // a new task arrived in the meantime
-            }
-            condition_tasks.wait(lock, [&]{
-                return worker.stop || !running || !worker.yielding || !queue_tasks.empty();
-            });
+        QUE_DBG("processing task while yielding, id = %d\n", task.id);
+        bool               handled = true;
+        std::exception_ptr exception;
+        try {
+            // note: do not hold any lock here, the callback may post new tasks
+            handled = callback_new_task(std::move(task), true);
+        } catch (...) {
+            exception = std::current_exception();
         }
 
-        // signal to yield_to_queue() that no more tasks will be processed
-        {
-            std::unique_lock<std::mutex> lock(mutex_tasks);
-            worker.busy = false;
+        lock.lock();
+        if (exception) {
+            worker.exception = exception;
+            worker.failed    = true;   // serve nothing more in this yield; yield_to_queue() rethrows it
+        } else if (!handled) {
+            // set it aside, do not put it back in the queue, else we offer it again in a loop
+            QUE_DBG("task declined, id = %d\n", task.id);
+            queue_tasks_unhandled.push_back(std::move(task));
         }
-        condition_tasks.notify_all();
+        worker.in_task = false;
+        condition_tasks.notify_all(); // the end of the yield may be waiting for this task
     }
 }
 
@@ -224,13 +229,17 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
     QUE_DBG("%s", "yielding to queue\n");
 
+    bool wake_worker = false;
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
-        GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
-        worker.busy     = true;
+        GGML_ASSERT(!worker.yielding && "yield_to_queue() cannot be nested");
         worker.yielding = true;
+        worker.failed   = false;
+        wake_worker     = !queue_tasks.empty();   // later tasks wake it from post()
     }
-    worker.cv.notify_one();
+    if (wake_worker) {
+        worker.cv.notify_one();
+    }
 
     // run the work on the current thread, so that all ggml compute stays on the same thread
     std::exception_ptr exception;
@@ -243,11 +252,11 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
 
-        // the yield is over, wait for the worker to finish its current task
+        // the yield is over: from here the worker starts no task (it takes one only while `yielding` holds under this
+        // lock). Wait for the one it may be executing -- an idle worker is neither woken nor waited for.
         worker.yielding = false;
-        condition_tasks.notify_all();
         condition_tasks.wait(lock, [&]{
-            return !worker.busy;
+            return !worker.in_task;
         });
 
         // put the declined tasks back, keeping their order
@@ -282,8 +291,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     // spawn the worker thread used by yield_to_queue()
     GGML_ASSERT(!worker.thread.joinable() && "start_loop() is already running");
     worker.stop     = false;
-    worker.busy     = false;
     worker.yielding = false;
+    worker.in_task  = false;
+    worker.failed   = false;
     worker.thread = std::thread([this]() { worker_loop(); });
 
     constexpr auto max_wait_time = std::chrono::seconds(1);

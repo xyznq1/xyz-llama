@@ -171,7 +171,7 @@ enum common_params_sampling_config : uint64_t {
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_XYZ,  // Xyz speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
@@ -331,6 +331,19 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // Coupled (shared-noise) selection. Drafter and target draw with the same Gumbel stream keyed by
+    // (coupled_seed, seq_id, absolute position, token id), so they agree with probability
+    // 1 - TV(p_draft, p_target) instead of the far smaller independent-draw collision rate. The
+    // target's own draw stays an exact sample from its distribution, so output quality is unchanged.
+    // coupled_seed is resolved ONCE (not per sampler) because the two sides must share one stream --
+    // each sampler's own seed is randomised independently and would never match.
+    bool     coupled      = false;
+    uint32_t coupled_seed = 0;
+
+    // Rejection verify (--spec-rejection): a drafted token that was DRAWN from a recorded proposal q is accepted with
+    // probability min(1, p/q) and a rejection draws from the residual -- the maximal coupling, 1 - TV per position.
+    bool     rejection    = false;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -373,7 +386,7 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
-    // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
+    // used by Simple, MTP, Xyz, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
     common_params_speculative_ngram_mod ngram_mod;
@@ -393,7 +406,7 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_XYZ || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -990,6 +1003,7 @@ enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
     COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
     COMMON_CONTEXT_SEQ_RM_TYPE_RS = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+    COMMON_CONTEXT_SEQ_RM_TYPE_RS_REPLAY = 4, // snapshot-free recurrent rollback: partial seq_rm above the committed position always works
 };
 
 // check if the llama_context can remove sequences
@@ -1175,7 +1189,7 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
-    // (e.g. eagle3's deferred-boundary g_embd row)
+    // (e.g. xyz's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
     size_t size() const;

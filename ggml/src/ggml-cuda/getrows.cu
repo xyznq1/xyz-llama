@@ -324,6 +324,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK2_0, QR2_0, dequantize_q2_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        // PrismML types get their OWN cases, not a fall-through to Q2_0: they have different block
+        // widths (128 vs 64) and different decoders. Falling through would have silently produced
+        // wrong embeddings rather than an error -- the worst failure mode available here.
+        case GGML_TYPE_PQ2_0:
+            get_rows_cuda_q<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_PTQ1_0:
+            GGML_ABORT("PTQ1_0 ILV16: rows need the matrix row count -- ggml_cuda_op_get_rows takes this type");
+            break;
         case GGML_TYPE_Q4_0:
             get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
@@ -439,6 +449,60 @@ void get_rows_cuda(
     }
 }
 
+// PTQ1_0 rows out of ILV16 matrices (common.cuh): k_get_rows reads a row as one run of blocks, which only the row-major
+// part of a matrix still is. Same grid and element order as k_get_rows; the matrix row count decides whole tiles.
+template<typename dst_t>
+static __global__ void k_get_rows_ptq1_ilv(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3, const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_sync();
+    const int64_t stride_row = nb01 / sizeof(block_ptq1_0);
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        for (int64_t i00 = 2*(blockIdx.y*blockDim.x + threadIdx.x); i00 < ne00; i00 += gridDim.y*blockDim.x) {
+            const int i10 = blockIdx.x;
+            const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+            const int i11 = dm.x;
+            const int i12 = dm.y;
+
+            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+            dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+            const void * matrix = (const char *) src0 + i11*nb02 + i12*nb03;
+
+            const int64_t ib  = ptq1_ilv_block(i01, i00/QK_PTQ1_0, stride_row, ne01);
+            const int     iqs = (i00%QK_PTQ1_0)/QR_PTQ1_0;
+            const int64_t iybs = i00 - i00%QK_PTQ1_0;
+            const int y_offset = QR_PTQ1_0 == 1 ? 1 : QK_PTQ1_0/2;
+
+            float2 v;
+            dequantize_ptq1_0(matrix, ib, iqs, v);
+
+            dst_row[iybs + iqs + 0]        = ggml_cuda_cast<dst_t>(v.x);
+            dst_row[iybs + iqs + y_offset] = ggml_cuda_cast<dst_t>(v.y);
+        }
+    }
+}
+
+template<typename dst_t>
+static void get_rows_cuda_ptq1_ilv(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cudaStream_t stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const int block_num_y = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1) / (2*CUDA_GET_ROWS_BLOCK_SIZE);
+    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+    GGML_ASSERT(ne00 % 2 == 0);
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+
+    k_get_rows_ptq1_ilv<<<block_nums, block_dims, 0, stream>>>(
+        src0->data, (const int32_t *) src1->data, (dst_t *) dst->data, ne00, ne01, ne11, init_fastdiv_values(ne12),
+        nb1/sizeof(dst_t), nb2/sizeof(dst_t), nb3/sizeof(dst_t), nb01, nb02, nb03,
+        nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t));
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -453,6 +517,15 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    if (src0->type == GGML_TYPE_PTQ1_0) {
+        switch (dst->type) {
+            case GGML_TYPE_F32:  get_rows_cuda_ptq1_ilv<float>      (src0, src1, dst, stream); return;
+            case GGML_TYPE_F16:  get_rows_cuda_ptq1_ilv<half>       (src0, src1, dst, stream); return;
+            case GGML_TYPE_BF16: get_rows_cuda_ptq1_ilv<nv_bfloat16>(src0, src1, dst, stream); return;
+            default: GGML_ABORT("%s: unsupported dst type for PTQ1_0: %s\n", __func__, ggml_type_name(dst->type));
+        }
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

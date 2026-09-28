@@ -139,6 +139,46 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// Each thread owns one short destination row. Loads coalesce across channel-fastest sources.
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_short_rows(
+        const char * src0, const char * src1, char * dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t nrows,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
+
+    const int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    const int64_t i1 = row % ne1;
+    const int64_t i2 = (row / ne1) % ne2;
+    const int64_t i3 = row / (ne1*ne2);
+
+    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+        const T * x;
+        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+            x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+        } else if constexpr (dim == 0) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+        } else if constexpr (dim == 1) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+        } else if constexpr (dim == 2) {
+            x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+        } else {
+            x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+        }
+        *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+    }
+}
+
+// rows up to this long take concat_non_cont_short_rows
+#define CUDA_CONCAT_SHORT_ROW 32
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +200,27 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dst->ne[0] <= CUDA_CONCAT_SHORT_ROW) {
+        GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        const int64_t nrows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+        const int64_t nblk  = (nrows + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+        auto launch_kernel = [&](auto dim) {
+            concat_non_cont_short_rows<T, dim><<<(unsigned) nblk, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], nrows,
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+        };
+        switch (dim) {
+            case 0: launch_kernel(std::integral_constant<int, 0>{}); break;
+            case 1: launch_kernel(std::integral_constant<int, 1>{}); break;
+            case 2: launch_kernel(std::integral_constant<int, 2>{}); break;
+            case 3: launch_kernel(std::integral_constant<int, 3>{}); break;
+            default: GGML_ABORT("Invalid dim: %d", dim);
+        }
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 

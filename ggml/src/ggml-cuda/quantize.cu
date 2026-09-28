@@ -50,6 +50,11 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+// Permute each four-block q8_1 group for the PTQ1 tensor-core kernel. Each 128-value group's four 36-byte blocks become one 144-byte record:
+// int32 word (c*8 + 2*s + h) = bytes 16h+4c..16h+4c+3 of block s (lane c's 8 B-fragment words contiguous), then the 4
+// half2 (d, sum) of blocks 0..3 at byte 128. Each lane then loads 2 x 16 B of values + 16 B of scales per column instead of
+// 8 scattered 4-byte words + 8 2-byte scales.
+template <bool ptq1_perm = false>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -90,6 +95,17 @@ static __global__ void quantize_q8_1(
 
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    if constexpr (ptq1_perm) {
+        char * rec = (char *) vy + (ib / 4) * (4 * (int64_t) sizeof(block_q8_1));   // 144 bytes = blocks 4r..4r+3
+        const int s = ib % 4;
+        rec[((iqs % 16)/4*8 + 2*s + iqs/16)*4 + iqs % 4] = q;
+        const int sum_q = warp_reduce_sum<QK8_1>((int) q);   // PTQ1_MMA_ISUM: v1's accumulator start (common.cuh)
+        if (iqs == 0) {
+            ((half2 *) (rec + 4*QK8_1))[s] = ptq1_perm_ds(d, sum, sum_q);
+        }
+        return;
+    }
 
     y[ib].qs[iqs] = q;
 
@@ -568,8 +584,20 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
     GGML_UNUSED(type_src0);
+}
+
+void quantize_row_q8_1_ptq1_perm_cuda(
+        const float * x, void * vy, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % (4*QK8_1) == 0);   // whole 128-value records per row
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
 }
 
 void quantize_mmq_q8_1_cuda(

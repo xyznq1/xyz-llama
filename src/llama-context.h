@@ -81,6 +81,19 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // the logits prefilter: see logits_topk below
+    void    set_logits_topk(int32_t k);
+    int32_t get_logits_topk_ith(int32_t i, const int32_t ** ids, const float ** vals);
+
+    // the device draft chain: see dchain below
+    bool draft_chain_init(const int32_t * col_ids, int32_t n_col, int32_t n_steps, int32_t top_k, float top_p);
+    void draft_chain_set (int32_t mode, int32_t step, uint64_t key);
+    bool draft_chain_get (int32_t * out, int32_t n);
+
+    // the early verify: see vchain below
+    bool verify_chain_arm(llama_context * ctx_dft, int32_t n_draft);
+    bool draft_chain_fetch(int32_t n);   // queue the records' download (dchain_rec_host below)
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -89,6 +102,11 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);
+
+    // Register the draft model's feature fusion in the target graph. The getter returns nullptr when the current decode
+    // did not produce the fold.
+    bool    set_fc_fold(const llama_model * model_dft, const int32_t * layers, int32_t n_layers);
+    float * get_fc_fold();
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -291,6 +309,46 @@ private:
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
+    // THE LOGITS PREFILTER. Every speculative round copied 5 full-vocabulary logit rows
+    // to the host (5 x 248,320 floats = 4.97 MB, ~235 us at the end of every verify) for a sampler whose
+    // chain reads only its top-20. With logits_topk > 0, a decode that fits one ubatch also emits each output row's
+    // top-k (llm_graph_context::build_logits_topk) and only those (ids, logits) are copied; the full rows stay in the
+    // graph's output tensor on the device and get_logits_ith() fetches a row on demand (the reasoning budget's forcing,
+    // n_probs, a tie at the k boundary). logits_dev_row[j] = the device row of host output row j, -1 = on the host.
+    // the device draft chain's state and its persistent device tensors (llama_draft_chain, llama-graph.h)
+    llama_draft_chain       dchain;
+    ggml_context_ptr        dchain_ctx;
+    ggml_backend_buffer_ptr dchain_buf;
+
+    // THE EARLY VERIFY: the next decode's draft rows come from this draft chain (another context's,
+    // still running on the device) -- llm_graph_params::vchain. Armed by verify_chain_arm, cleared by that decode.
+    // vchain_ev orders it on the device: recorded on the draft context's stream, waited on this context's.
+    const llama_draft_chain * vchain    = nullptr;
+    int32_t                   vchain_n  = 0;
+    ggml_backend_event_t      vchain_ev = nullptr;
+    // the wait on vchain_ev is handed to the backend right before the verify's graph compute, which
+    // queues it on the stream only after the scheduler has handled the graph's inputs
+    bool                      vchain_wait_pending = false;
+
+    // the chain's records come down on the chain's OWN stream into pinned memory, queued right behind the last draw
+    // (draft_chain_fetch), and draft_chain_get waits on that copy's event alone. The blocking download it replaces ran on
+    // cudaStreamPerThread into pageable memory, and with the early verify issued first it waited out the whole verify
+    // (12.5 ms per round against 1.4 without it).
+    ggml_backend_buffer_ptr dchain_rec_host;
+    ggml_backend_event_t    dchain_rec_ev = nullptr;
+    int32_t                 dchain_rec_n  = 0;   // records whose download is in flight (0 = none)
+
+    ggml_backend_t backend_gpu() const;   // the first GPU backend of this context, or nullptr
+
+    int32_t              logits_topk     = 0;
+    bool                 topk_this_decode = false;
+    bool                 topk_valid      = false;
+    buffer_view<int32_t> topk_ids        = {nullptr, 0};
+    buffer_view<float>   topk_vals       = {nullptr, 0};
+    ggml_tensor *        logits_dev      = nullptr;
+    std::vector<int32_t> logits_dev_row;
+    void logits_fetch_row(int64_t j);
+
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
@@ -303,6 +361,20 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // Registered draft feature fusion and its host/device result for the current small decode.
+    static constexpr int32_t FC_FOLD_MAX_TOKENS = 16;
+    const ggml_tensor *      fc_fold_w     = nullptr;
+    const ggml_tensor *      fc_fold_scale = nullptr;
+    const ggml_tensor *      fc_fold_norm  = nullptr;
+    float                    fc_fold_eps  = 0.0f;
+    std::vector<int32_t>     fc_fold_layers;
+    int64_t                  fc_fold_n_out = 0;
+    ggml_backend_buffer_ptr  fc_fold_buf;
+    float *                  fc_fold_host = nullptr;
+    bool                     fc_fold_this_decode = false;
+    bool                     fc_fold_valid       = false;
+    int64_t                  fc_fold_rows        = 0;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -367,6 +439,17 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // the drafter's per-shape graphs -- each seed row count and the chain step -- on their own
+    // scheduler + graph slot, kept built and allocated across rounds. With one slot, the chain step displaced the seed
+    // every round: build 0.055 + scheduler alloc 0.067 + a rebuilt graph's backend check ~0.05 ms, all on the critical
+    // path after the verify. decode() swaps the pair in for such a ubatch and back after.
+    struct alt_graph {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    std::map<int, alt_graph> alt_graphs;
+    void alt_graphs_reset();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -386,6 +469,7 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+    bool            sync_pending       = true;   // work issued since the last completed synchronize
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

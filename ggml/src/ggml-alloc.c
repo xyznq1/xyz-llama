@@ -43,6 +43,9 @@ bool ggml_op_can_inplace(enum ggml_op op) {
         case GGML_OP_CLAMP:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_SOFT_MAX_BACK:
+        // Split GLU kernels read x[i] and g[i] before writing dst[i], so matching single-use buffers may be reused.
+        // Fused GLU tensors and gate/up views do not satisfy these constraints.
+        case GGML_OP_GLU:
             return true;
 
         default:
@@ -421,7 +424,14 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+// Add headroom after a buffer grows to avoid repeated device-synchronizing reallocations.
+static size_t ggml_vbuffer_regrow_pad(size_t size) {
+    const size_t pad = size / 16;
+    return pad > ((size_t) 4 << 20) ? pad : ((size_t) 4 << 20);
+}
+
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage,
+                                           bool regrow) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
@@ -429,6 +439,9 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        if (regrow) {
+            chunk_size += ggml_vbuffer_regrow_pad(chunk_size);
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -932,11 +945,12 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            const bool regrow = galloc->buffers[i] != NULL;   // outgrown, not the first allocation
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE, regrow);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
@@ -1003,7 +1017,8 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
-    return talloc->size_max >= node_size;
+    // Exact sizes keep tensor addresses independent of the graph planned previously.
+    return talloc->size_max == node_size;
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {

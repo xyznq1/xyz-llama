@@ -37,6 +37,14 @@ class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
+    struct cell_state {
+        llama_pos        pos;
+        llama_kv_cell_ext ext;
+        seq_set_t         seq;
+    };
+
+    using state_vec_t = std::vector<cell_state>;
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
@@ -52,6 +60,33 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+
+        pos_dirty_mark_all();
+    }
+
+    // DEVICE KQ MASK: the cells whose position changed since the cache's device mirror of
+    // the positions (llama_kv_cache::pos_dev) last took them. Every position write in this class records its cell; a
+    // bulk change (reset, more than POS_DIRTY_MAX cells) marks everything. Bookkeeping for an outside copy, not state
+    // of the cells, so it is mutable: the consumer -- a const set_input, right before the graph that uploads them --
+    // takes the list and clears it.
+    static constexpr uint32_t POS_DIRTY_MAX = 4096;
+
+    bool pos_dirty_all() const {
+        return pos_dirty_all_;
+    }
+
+    const std::vector<uint32_t> & pos_dirty() const {
+        return pos_dirty_;
+    }
+
+    void pos_dirty_clear() const {
+        pos_dirty_all_ = false;
+        pos_dirty_.clear();
+    }
+
+    // the mirror's contents are unknown (a compute that should have updated it failed): upload every cell next time
+    void pos_dirty_invalidate() const {
+        pos_dirty_mark_all();
     }
 
     void reset_shift() {
@@ -84,6 +119,38 @@ public:
 
     uint32_t get_used() const {
         return used.size();
+    }
+
+    // KQ-mask fast path (llama-kv-cache.cpp set_input_kq_mask_impl): when every used cell carries seq_id
+    // (seq_n_cells(seq_id) == get_used()), visibility is a position compare on pos_data() alone -- no per-cell bitset
+    // read (LLAMA_MAX_SEQ 256 = 32 bytes per cell) -- and the cells near the batch come from the ordered seq_pos index.
+    uint32_t seq_n_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        return seq_pos[seq_id].size();
+    }
+
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
+    // f(cell) for every cell of seq_id with position >= p, in position order
+    template <typename F>
+    void seq_cells_from(llama_seq_id seq_id, llama_pos p, F && f) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p, 0u }); it != sp.end(); ++it) {
+            f(it->second);
+        }
+    }
+
+    // f(cell) for every cell of seq_id with p_lo <= position <= p_hi, in position order
+    template <typename F>
+    void seq_cells_range(llama_seq_id seq_id, llama_pos p_lo, llama_pos p_hi, F && f) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p_lo, 0u }); it != sp.end() && it->first <= p_hi; ++it) {
+            f(it->second);
+        }
     }
 
     // the index of the first cell that is used
@@ -162,6 +229,18 @@ public:
         return res;
     }
 
+    state_vec_t state_get(const std::vector<uint32_t> & idxs) const {
+        state_vec_t res;
+        res.reserve(idxs.size());
+
+        for (const uint32_t idx : idxs) {
+            res.push_back({ pos[idx], ext[idx], seq[idx] });
+            assert(shift[idx] == 0);
+        }
+
+        return res;
+    }
+
     // set the state of cells [i, i + other.pos.size()) (used for save/restore the state of the cells)
     void set(uint32_t i, const llama_kv_cells & other) {
         assert(i + other.pos.size() <= pos.size());
@@ -184,6 +263,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            pos_dirty_add(idx);
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -215,6 +295,38 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            pos_dirty_add(idx);
+
+            if (pos[idx] != -1) {
+                seq_pos_add(idx);
+            }
+
+            assert(shift[idx] == 0);
+        }
+    }
+
+    void state_set(const std::vector<uint32_t> & idxs, const state_vec_t & state) {
+        assert(idxs.size() == state.size());
+
+        for (uint32_t j = 0; j < state.size(); ++j) {
+            const auto idx = idxs[j];
+
+            if (pos[idx] == -1 && state[j].pos != -1) {
+                used.insert(idx);
+            }
+
+            if (pos[idx] != -1 && state[j].pos == -1) {
+                used.erase(idx);
+            }
+
+            if (pos[idx] != -1) {
+                seq_pos_rm(idx);
+            }
+
+            pos[idx] = state[j].pos;
+            ext[idx] = state[j].ext;
+            seq[idx] = state[j].seq;
+            pos_dirty_add(idx);
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -235,6 +347,7 @@ public:
         pos[i] = -1;
         ext[i].reset();
         shift[i] = 0;
+        pos_dirty_add(i);
 
         used.erase(i);
     }
@@ -254,6 +367,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            pos_dirty_add(i);
 
             used.erase(i);
 
@@ -284,6 +398,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            pos_dirty_add(i);
 
             used.erase(i);
 
@@ -425,6 +540,7 @@ public:
         assert(seq[i].none());
 
         pos[i] = p;
+        pos_dirty_add(i);
 
         used.insert(i);
     }
@@ -445,6 +561,7 @@ public:
 
         pos[i]   += d;
         shift[i] += d;
+        pos_dirty_add(i);
 
         has_shift = true;
 
@@ -476,6 +593,7 @@ public:
 
         pos[i]   /= d;
         shift[i] += p_old - pos[i];
+        pos_dirty_add(i);
 
         seq_pos_add(i);
 
@@ -522,6 +640,25 @@ private:
     //  - some vision models have input embeddings with repeating positions
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
+
+    // the device-mirror bookkeeping (see pos_dirty above)
+    mutable bool                  pos_dirty_all_ = true;   // the mirror starts unwritten
+    mutable std::vector<uint32_t> pos_dirty_;
+
+    void pos_dirty_add(uint32_t i) const {
+        if (!pos_dirty_all_) {
+            if (pos_dirty_.size() >= POS_DIRTY_MAX) {
+                pos_dirty_mark_all();
+            } else {
+                pos_dirty_.push_back(i);
+            }
+        }
+    }
+
+    void pos_dirty_mark_all() const {
+        pos_dirty_all_ = true;
+        pos_dirty_.clear();
+    }
 
     // helper functions for updating `seq_pos`, once cell at a time:
 

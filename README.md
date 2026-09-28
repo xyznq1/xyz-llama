@@ -1,126 +1,98 @@
-# llama.cpp
+# xyz
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+Ternary Bonsai 2 27B with 160k context in about 8 GB of GPU memory, running at about 140 tokens/s on an RTX 4070 Ti SUPER.
 
-<div align="center">
+We forked [llama.cpp](https://github.com/ggml-org/llama.cpp) and built what PrismML's 1.75-bit Ternary Bonsai 2 27B
+(Qwen3.8-27B, `PTQ1_0`) needs to run fast at long context, our own CUDA kernels for the ternary weights, a 2-bit KV
+cache so 160k context stays small, and our drafter, xyz v1.2, trained on the model's own outputs. It's lossless, the model
+checks every token the drafter guesses, so you get the exact same text the model would write on its own, just faster.
 
-<b>LLM inference in C/C++</b>
+We measured it on an RTX 4070 Ti SUPER (16 GB, stock power limit) at around 161k context, temperature 1.0, top-k 20,
+top-p 0.95, over 10 generations (11,964 tokens): 139.5 tokens/s and 2.82 tokens per round. With `XYZ_ENGINE=1` it's
+144.2 tokens/s, same text.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+## What's in it
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
-
-</div>
+- Our PTQ1_0 / PQ2_0 kernels, CUDA matmuls for Bonsai's ternary and 2-bit weights, the Hadamard-rotated weights get
+  handled in the graph. (`ggml/src/ggml-cuda/mmvq-ptq1-mma.cuh`, `mmq*`, `src/llama-graph.cpp`)
+- The xyzkv2 KV cache, a 2-bit rotated KV cache with our MMA flash attention, that's what gets 160k into about 8 GB with the model.
+  (`ggml/src/ggml-cuda/fattn-*`, `set-rows.cu`)
+- The xyz v1.2 drafter, our one-layer draft head on the model's hidden states, it drafts on the GPU with no trip back
+  to the host for every token. (`src/models/xyz.cpp`, `common/speculative.cpp`)
+- Coupled sampling and block verification, the drafter and the model share the same random noise, and block
+  verification keeps the longest draft the model agrees with, so every token is still an exact sample from the model.
+  (`common/sampling.cpp`, `src/llama-sampler.cpp`)
+- Faster rounds, the verify starts right behind the draft, the drafter's inputs get built inside the model's graph,
+  catch-up rows ride along with the next draft, rejected tokens roll back without snapshots, masks get built on the
+  GPU and logits come back as top-k pairs. (`src/llama-context.cpp`, `src/llama-kv-cache.cpp`, `src/models/qwen35.cpp`)
+- Prompt caching, context checkpoints for the hybrid model plus an optional SSD tier under the RAM cache.
+  (`tools/server`)
+- xyz-engine (optional, Windows), our own CUDA runtime for the speculative rounds, one graph per round shape and fused
+  small kernels, same text as the normal path. (`xyz-engine/`)
 
 ## Quick start
 
-A few options to get `llama.cpp` installed on your machine:
+On Windows, grab `xyz-win-cuda13-x64.zip` from the releases, unzip it and run `scripts\xyz-serve.cmd`, that's it.
+Everything's in the zip, the server with our kernels, cuBLAS, the C++ runtime and the drafter. The first start
+downloads the model (5.9 GB, from
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)) and keeps it, after
+that you've got an OpenAI-compatible API and a chat page on `http://127.0.0.1:8080`. If you already have
+`Ternary-Bonsai-2-27B-PTQ1_0.gguf`, drop it in `models\` and nothing gets downloaded.
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+You need an NVIDIA GPU with 10 GB or more and a driver that supports CUDA 13, at 160k context it takes about 8 GB (7.7 GB
+measured on ours). On an 8 GB card lower `-c` in the serve script, we haven't tested that one. The kernels are built for RTX 30, 40 and 50 series and
+DGX Spark, on RTX 20 series, A100 and H100 the driver compiles them on the first start, so that one takes a while.
 
-Once installed:
+On Linux, or if you want to build it yourself, you need the CUDA 13 toolkit and CMake (we tested CUDA 13.3 with Visual
+Studio 2022):
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_BORINGSSL=ON
+cmake --build build --config Release -j 4
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+That builds for whatever GPU you have. Then run `scripts/xyz-serve.sh`, the first start downloads the model and our
+drafter (from [xyz-drafter](https://github.com/xyznq1/xyz-drafter)) and keeps them.
 
-## Description
+All the settings are one command in `scripts/xyz-serve.*`, 160k context, the xyzkv2 KV cache for the model, q4_0 for
+the drafter, four drafted tokens per round, coupled sampling with block verification. Everything else is llama-server's
+defaults, if you want something different just edit that command.
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+## Options
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+- `XYZ_PC_DISK_DIR`, `XYZ_PC_DISK_GB`: an SSD tier for the prompt cache, prompts that fall out of RAM go to this folder
+  (40 GB cap by default) and come back later without being processed again.
+- `XYZ_ENGINE=1`: runs the speculative rounds and prompt batches on xyz-engine (Windows, RTX 30 series or newer).
+  `xyz_engine.dll` and `expf_exc.bin` sit next to the server and get built with it. The startup log says
+  `xyz-engine: ON`, or `OFF` and why. Anything the engine doesn't cover runs on the normal path.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## Notes
 
-## Supported backends
+- We tested on an RTX 4070 Ti SUPER (sm_89) with Windows 11 and CUDA 13.3. Other cards and Linux should work, we just
+  haven't tested them. xyz-engine is Windows only.
+- If it runs out of memory on startup, lower `-c` in the serve script.
+- If port 8080 is taken, set `LLAMA_ARG_PORT` to another port before you start the script.
+- The drafter only works with this model, it reads the model's hidden states and uses its vocabulary.
+- It's text only, with the drafter on the vision projector doesn't get loaded.
+- llama.cpp's own docs are in [docs/llama.cpp-README.md](docs/llama.cpp-README.md).
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## Credits
 
-## Documentation
+What's ours: the PTQ1_0 / PQ2_0 CUDA kernels and their ILV16 weight layout, the xyzkv2 KV cache and its MMA flash
+attention, the xyz v1.2 drafter and its training data, the coupled sampling, our block verification implementation,
+the round work, the SSD prompt-cache tier and xyz-engine.
 
-#### Tools
+What we built on, and credit to the people who made it:
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), the base of this fork.
+- PrismML's Ternary Bonsai 2 27B and its PTQ1_0 / PQ2_0 formats. Our PTQ1_0 decode follows
+  [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp), branch `prism`.
+- TurboQuant ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)), the method behind our xyzkv2 cache. Our cache
+  started from wszhoho's llama.cpp port, `llama-cpp-turboquant-DFlash2`, which isn't online anymore.
+- EAGLE-3 ([arXiv:2503.01840](https://arxiv.org/abs/2503.01840)), the design our xyz v1.2 draft head follows.
+- Block verification ([arXiv:2403.10444](https://arxiv.org/abs/2403.10444)), the verification method we implemented.
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## License
 
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+The code is MIT. `xyz-v1.2-drafter.gguf` is Apache-2.0, since it carries rows of Ternary Bonsai 2 27B's output head
+(PrismML, Apache-2.0), which comes from Qwen/Qwen3.8-27B (Apache-2.0). The Windows zip also has NVIDIA's cuBLAS DLLs
+(redistributable under the CUDA Toolkit license) and Microsoft's C++ runtime DLLs (Visual Studio redistributables).

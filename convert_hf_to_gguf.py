@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         "--target-model-dir", type=str, default=None,
         help=(
             "path to the target model directory; required when converting a standalone draft model "
-            "(e.g. EAGLE3 / DFlash) that needs target-model metadata such as tokenizer, hidden size, and "
+            "(e.g. XYZ / DFlash) that needs target-model metadata such as tokenizer, hidden size, and "
             "layer count to populate its GGUF."
         ),
     )

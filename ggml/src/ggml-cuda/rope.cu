@@ -2,43 +2,8 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
-
-struct rope_corr_dims {
-    float v[2];
-};
-
-
-struct mrope_sections {
-    int v[4];
-};
-
-static __device__ float rope_yarn_ramp(const float low, const float high, const int i0) {
-    const float y = (i0 / 2 - low) / max(0.001f, high - low);
-    return 1.0f - min(1.0f, max(0.0f, y));
-}
-
-// YaRN algorithm based on LlamaYaRNScaledRotaryEmbedding.py from https://github.com/jquesnelle/yarn
-// MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.
-template<bool forward>
-static __device__ void rope_yarn(
-        const float theta_extrap, const float freq_scale, const rope_corr_dims corr_dims, const int64_t i0, const float ext_factor,
-        float mscale, float & cos_theta, float & sin_theta) {
-    // Get n-d rotational scaling corrected for extrapolation
-    float theta_interp = freq_scale * theta_extrap;
-    float theta = theta_interp;
-    if (ext_factor != 0.0f) {
-        float ramp_mix = rope_yarn_ramp(corr_dims.v[0], corr_dims.v[1], i0) * ext_factor;
-        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
-
-        // Get n-d magnitude scaling corrected for interpolation
-        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    }
-    cos_theta = cosf(theta) * mscale;
-    sin_theta = sinf(theta) * mscale;
-    if (!forward) {
-        sin_theta *= -1.0f;
-    }
-}
+#include "xyzkv-quant.cuh"
+#include "attn-chain.cuh"    // rope_corr_dims, mrope_sections, rope_yarn (moved there), the Q/K head prologue
 
 template <bool forward, bool has_ff, typename T, typename D>
 static __global__ void rope_norm(const T *            x,
@@ -848,6 +813,93 @@ static void rms_norm_mul_rope_cuda(
                 freq_factors, row_indices, set_rows_stride, is_neox);
         }
     }
+}
+
+// Fuse the attention Q chain in one launch: RMS_NORM + MUL(q_norm) + ROPE (M-RoPE)
+// + the KV rotation's 256-point Hadamard (a MUL_MAT with the Hadamard hint = fwht_cuda<256>) + xyzkv's forward
+// 128-point WHT. One block of 256 threads handles each (head, token) row in shared memory.
+// Bit-identical by construction, stage by stage (norm, rope and fwht: attn-chain.cuh attn_head_prologue_256):
+//   xyzkv  k_xyzkv_wht_f32<0, 128> on each 128-half: x*scale_inv, then *SIGNS1, stages h = 1..64, then (x*inv_sqrt)*SIGNS2
+static __global__ void k_attn_q_chain(
+        const float * __restrict__ x, const int64_t sx1, const int64_t sx2,
+        const float * __restrict__ w, const float eps,
+        const int32_t * __restrict__ pos, const int ne02, const attn_mrope_params rp,
+        const float fwht_scale, const float * __restrict__ scale_inv,
+        float * __restrict__ dst, const int n_heads) {
+    constexpr int N = 256;
+    __shared__ float s[N];
+    __shared__ float s_sum[32];
+
+    const int row  = blockIdx.x;          // the norm's row order: head + token*n_heads
+    const int head = row % n_heads;
+    const int tok  = row / n_heads;
+    const int tid  = threadIdx.x;
+
+    // 1-3. RMS_NORM + MUL, M-RoPE, the KV rotation's 256-point Hadamard
+    ggml_cuda_pdl_sync();   // launched with ggml_cuda_kernel_launch: wait for the producer before reading (no-op below sm_90)
+    attn_head_prologue_256(s, s_sum, x + tok*sx2 + head*sx1, w, eps, pos, tok, ne02, rp, fwht_scale);
+
+    // 4. xyzkv forward WHT on each 128-half
+    const int t = tid % 128;
+    if (scale_inv != nullptr) {
+        s[tid] *= scale_inv[t];
+    }
+    s[tid] *= XYZKV_WHT_SIGNS1[t];
+    __syncthreads();
+#pragma unroll
+    for (int h = 1; h < 128; h *= 2) {
+        if (tid < N/2) {
+            const int g = tid / 64;
+            const int p = tid % 64;
+            const int e = g*128 + (p / h) * 2*h + (p % h);
+            const float a = s[e];
+            const float b = s[e + h];
+            s[e]     = a + b;
+            s[e + h] = a - b;
+        }
+        __syncthreads();
+    }
+    constexpr float inv_sqrt = 0.08838834764831845f;
+    dst[(int64_t) row*N + tid] = s[tid] * inv_sqrt * XYZKV_WHT_SIGNS2[t];
+}
+
+bool ggml_cuda_op_attn_q_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+                               const ggml_tensor * rope, const ggml_tensor * had, ggml_tensor * xyzkv) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * scale_inv = xyzkv->src[1];
+    constexpr int N = 256;
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 || xyzkv->type != GGML_TYPE_F32 ||
+            x->ne[0] != N || x->nb[0] != sizeof(float) || x->ne[3] != 1 || !ggml_are_same_shape(rms_norm, x) ||
+            !ggml_are_same_shape(mul, x) || !ggml_are_same_shape(rope, x) || ggml_nelements(xyzkv) != ggml_nelements(x) ||
+            !ggml_is_contiguous(xyzkv) || xyzkv->ne[0] != N ||
+            w->ne[0] != N || ggml_nrows(w) != 1 || !ggml_is_contiguous(w) ||
+            had->ne[0] != N || had->src[0]->ne[0] != N || had->src[0]->ne[1] != N ||
+            (scale_inv != nullptr && (scale_inv->type != GGML_TYPE_F32 || ggml_nelements(scale_inv) < 128))) {
+        return false;
+    }
+    int direction = 0, group_size = 0;
+    memcpy(&direction,  xyzkv->op_params + 0,           sizeof(int));
+    memcpy(&group_size, xyzkv->op_params + sizeof(int), sizeof(int));   // op_params[4], as ggml_xyzkv_wht stores it
+    if (direction != 0 || group_size != 128) {
+        return false;
+    }
+    attn_mrope_params rp;
+    if (!attn_mrope_params_get(rope, rp)) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const float fwht_scale = 1 / sqrtf(N);                        // fwht_dispatch's
+
+    const int n_heads = (int) x->ne[1];
+    const int ne02    = (int) x->ne[2];
+    const ggml_cuda_kernel_launch_params lp(dim3((unsigned) (n_heads * ne02), 1, 1), dim3(N, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_attn_q_chain, lp, (const float *) x->data,
+        (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (x->nb[2] / sizeof(float)), (const float *) w->data, eps,
+        (const int32_t *) rope->src[1]->data, ne02, rp, fwht_scale, scale_inv ? (const float *) scale_inv->data : nullptr,
+        (float *) xyzkv->data, n_heads);
+    return true;
 }
 
 void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,

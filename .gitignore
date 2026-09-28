@@ -149,7 +149,5 @@ flake.lock
 # emscripten
 a.out.*
 
-# AGENTS
-
-AGENTS.local.md
-.pi/SYSTEM.md
+# xyz-engine's expf exception table ships with the source (the server loads it next to the DLL)
+!/xyz-engine/expf_exc.bin

@@ -25,6 +25,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   rs_pack_tokens,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -34,6 +35,24 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+
+    this->pack_tokens = rs_pack_tokens;
+    prefix_n.assign(n_seq_max, -1);
+    if (pack_tokens > 0) {
+        GGML_ASSERT(n_rs_seq == 0 && "prefix replay replaces the snapshot planes");
+        const int64_t S_k = hparams.ssm_d_state;
+        const int64_t H_k = hparams.ssm_n_group;
+        const int64_t H_v = hparams.ssm_dt_rank;
+        const int64_t S_v = hparams.ssm_d_inner / std::max<int64_t>(1, H_v);
+        // worst case for the q/k head count: without the fused GDN op the graph repeats q/k to the
+        // v-head count before the recurrence (qwen35.cpp), so size the pack row for H_k = H_v and let
+        // the graph use whatever it actually packs (it asserts <=)
+        pack_row_gdn  = ggml_gated_delta_net_pack_row(S_k, std::max<int64_t>(H_k, H_v), S_v, H_v, false);
+        conv_channels = (int64_t) hparams.ssm_d_inner + 2 * (int64_t) hparams.ssm_n_group * hparams.ssm_d_state;
+        conv_window   = (int64_t) hparams.ssm_d_conv - 1;
+        LLAMA_LOG_INFO("%s: prefix replay: one state row per seq; pack %lld (GDN) + %lld (conv) floats per token, %u tokens per cell\n",
+                __func__, (long long) pack_row_gdn, (long long) conv_channels, pack_tokens);
+    }
 
     cells.clear();
     cells.resize(mem_size);
@@ -52,7 +71,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u) + (rs_pack_tokens > 0 ? 2u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -73,6 +92,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    pk_l.resize(n_layer);
+    px_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -105,6 +126,14 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+        if (pack_tokens > 0) {
+            ggml_tensor * pk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pack_row_gdn * pack_tokens, n_rows);
+            ggml_tensor * px = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) pack_tokens * conv_channels, n_rows);
+            ggml_format_name(pk, "cache_pk_l%d", i);
+            ggml_format_name(px, "cache_px_l%d", i);
+            pk_l[i] = pk;
+            px_l[i] = px;
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -156,6 +185,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(prefix_n.begin(), prefix_n.end(), -1);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -177,6 +207,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        if (seq_id >= 0 && (size_t) seq_id < prefix_n.size()) {
+            prefix_n[seq_id] = -1;
+        }
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -192,6 +225,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                if (pack_tokens > 0) {
+                    // snapshot-free mode: the row holds the state through pos_commit only; anything
+                    // above it is an uncommitted batch tail and is dropped by rewinding pos
+                    if (p0 > cell.pos_commit) {
+                        cell.pos = p0 - 1;
+                        return true;
+                    }
+                    return false;
+                }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
@@ -406,6 +448,7 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(prefix_n.begin(), prefix_n.end(), -1);
         return;
     }
 
@@ -604,6 +647,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (seq_meta.tail >= 0) {
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
+                empty_cell.pos_commit = orig_cell.pos_commit;
                 empty_cell.src = orig_cell.src;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
@@ -634,6 +678,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             auto & src_cell = cells[src_id];
 
             std::swap(dst_cell.pos, src_cell.pos);
+            std::swap(dst_cell.pos_commit, src_cell.pos_commit);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
@@ -663,6 +708,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
+        // snapshot-free mode: with a prefix replay this batch stays uncommitted -- everything before
+        // its first token is committed by the replay; commit-all otherwise
+        cell.pos_commit = (pack_tokens > 0 && apply_n_prev >= 0) ? ubatch.pos[i] - 1 : last_pos;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
@@ -766,6 +814,8 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
+    std::vector<std::pair<uint32_t, uint32_t>> rows_pending; // rs_replay: (logical row, pending tokens) per saved cell
+
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
     uint32_t cell_count = 0;
@@ -806,6 +856,9 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             } else {
                 cell_ranges_data.back().second++;
             }
+            if (pack_tokens > 0) {
+                rows_pending.emplace_back(cell_id, cell.pos > cell.pos_commit ? (uint32_t) (cell.pos - cell.pos_commit) : 0u);
+            }
 
             if (cell_range_begin == size) {
                 cell_range_begin = i;
@@ -842,6 +895,9 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     state_write_meta(io, cell_ranges, seq_id);
     state_write_data(io, cell_ranges_data);
+    if (pack_tokens > 0) {
+        state_write_packs(io, rows_pending);
+    }
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -856,6 +912,9 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     try {
         res = res && state_read_data(io, cell_count);
+        if (pack_tokens > 0) {
+            res = res && state_read_packs(io, cell_count);
+        }
     } catch (...) {
         res = false;
     }
@@ -884,6 +943,10 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
+            if (pack_tokens > 0) {
+                const llama_pos pos_commit = cell.pos_commit; // rs_replay: the row's committed position
+                io.write(&pos_commit, sizeof(pos_commit));
+            }
 
             if (n_seq_id) {
                 for (auto seq_id : cell.seq_id) {
@@ -989,6 +1052,91 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     }
 }
 
+// rs_replay: the pending (uncommitted) tokens of every saved cell travel with the state, so a restored
+// sequence replays them on its next decode instead of resuming up to pack_tokens tokens behind.
+// Block layout: magic, pack_tokens, pack_row_gdn, conv_channels; then per cell: u32 pending and, if
+// pending > 0, per layer with pack rows: the first `pending` GDN pack rows (token-major, contiguous)
+// and the whole conv pack row (also token-major -- channel-fastest, token 0 first, see delta-net-base's x_dst -- so
+// state_read_packs can load it into a pack of a different depth as a prefix copy).
+void llama_memory_recurrent::state_write_packs(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & rows_pending) const {
+    const uint32_t magic    = 0x5052524Bu; // 'PRRK'
+    const uint32_t n_layer  = hparams.n_layer();
+    const uint64_t pack_row = (uint64_t) pack_row_gdn;
+    const uint64_t conv_ch  = (uint64_t) conv_channels;
+    io.write(&magic,       sizeof(magic));
+    io.write(&pack_tokens, sizeof(pack_tokens));
+    io.write(&pack_row,    sizeof(pack_row));
+    io.write(&conv_ch,     sizeof(conv_ch));
+    for (const auto & rp : rows_pending) {
+        const uint32_t row     = rp.first;
+        const uint32_t pending = rp.second;
+        io.write(&pending, sizeof(pending));
+        if (pending == 0) {
+            continue;
+        }
+        GGML_ASSERT(pending <= pack_tokens);
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (pk_l[il] == nullptr) {
+                continue;
+            }
+            io.write_tensor(pk_l[il], (size_t) row * pk_l[il]->nb[1], (size_t) pending * pack_row * sizeof(float));
+            io.write_tensor(px_l[il], (size_t) row * px_l[il]->nb[1], (size_t) pack_tokens * conv_ch * sizeof(float));
+        }
+    }
+}
+
+bool llama_memory_recurrent::state_read_packs(llama_io_read_i & io, uint32_t cell_count) {
+    uint32_t magic = 0, pack_tokens_ref = 0;
+    uint64_t pack_row_ref = 0, conv_ch_ref = 0;
+    io.read(&magic,           sizeof(magic));
+    if (magic != 0x5052524Bu) {
+        LLAMA_LOG_ERROR("%s: rs_replay: pack block missing (state saved without LLAMA_RS_REPLAY?)\n", __func__);
+        return false;
+    }
+    io.read(&pack_tokens_ref, sizeof(pack_tokens_ref));
+    io.read(&pack_row_ref,    sizeof(pack_row_ref));
+    io.read(&conv_ch_ref,     sizeof(conv_ch_ref));
+    // A different pack DEPTH is fine (it follows the draft length, so a saved slot may carry another): the GDN rows travel as `pending` token rows, and the conv pack is token-major (channel-fastest,
+    // token 0 first -- delta-net-base's x_dst), so its first min(saved, current) tokens are a prefix copy. Only the row
+    // geometry must match; each cell's pending count is checked against the current depth below.
+    if (pack_row_ref != (uint64_t) pack_row_gdn || conv_ch_ref != (uint64_t) conv_channels) {
+        LLAMA_LOG_ERROR("%s: rs_replay: pack geometry mismatch (tokens %u/%u, row %llu/%llu, conv %llu/%llu)\n", __func__,
+                pack_tokens_ref, pack_tokens, (unsigned long long) pack_row_ref, (unsigned long long) pack_row_gdn,
+                (unsigned long long) conv_ch_ref, (unsigned long long) conv_channels);
+        return false;
+    }
+    const uint32_t n_layer = hparams.n_layer();
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        const uint32_t row  = head + i;
+        const auto &   cell = cells[row];
+        uint32_t pending = 0;
+        io.read(&pending, sizeof(pending));
+        const uint32_t pending_cell = cell.pos > cell.pos_commit ? (uint32_t) (cell.pos - cell.pos_commit) : 0u;
+        if (pending != pending_cell || pending > pack_tokens) {
+            LLAMA_LOG_ERROR("%s: rs_replay: cell %u pending %u does not match pos %d / pos_commit %d\n", __func__, row, pending, cell.pos, cell.pos_commit);
+            return false;
+        }
+        if (pending == 0) {
+            continue;
+        }
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (pk_l[il] == nullptr) {
+                continue;
+            }
+            io.read_tensor(pk_l[il], (size_t) row * pk_l[il]->nb[1], (size_t) pending * pack_row_gdn * sizeof(float));
+            if (pack_tokens_ref == pack_tokens) {
+                io.read_tensor(px_l[il], (size_t) row * px_l[il]->nb[1], (size_t) pack_tokens * conv_channels * sizeof(float));
+            } else {
+                std::vector<float> px_saved((size_t) pack_tokens_ref * conv_channels);
+                io.read(px_saved.data(), px_saved.size() * sizeof(float));
+                const size_t n_keep = (size_t) std::min(pack_tokens_ref, pack_tokens) * conv_channels;
+                ggml_backend_tensor_set(px_l[il], px_saved.data(), (size_t) row * px_l[il]->nb[1], n_keep * sizeof(float));
+            }
+        }
+    }
+    return true;
+}
+
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
     if (dest_seq_id != -1) {
         // single sequence
@@ -1001,6 +1149,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+        std::vector<llama_pos> pos_commit_saved(cell_count, -1); // rs_replay
 
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
@@ -1008,6 +1157,9 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
+            if (pack_tokens > 0) {
+                io.read(&pos_commit_saved[i], sizeof(llama_pos));
+            }
 
             if (n_seq_id != 0) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
@@ -1031,6 +1183,12 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         GGML_ASSERT(cells[head + cell_count - 1].pos == ubatch.pos[cell_count - 1]);
         GGML_ASSERT(cells[head].has_seq_id(dest_seq_id));
         GGML_ASSERT(cells[head + cell_count - 1].has_seq_id(dest_seq_id));
+        if (pack_tokens > 0) {
+            // find_slot committed through pos; the saved row is committed through pos_commit only
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                cells[head + i].pos_commit = pos_commit_saved[i];
+            }
+        }
     } else {
         // whole KV cache restore
 
@@ -1051,6 +1209,10 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
             io.read(&n_seq_id, sizeof(n_seq_id));
 
             cell.pos = pos;
+            cell.pos_commit = pos;
+            if (pack_tokens > 0) {
+                io.read(&cell.pos_commit, sizeof(cell.pos_commit));
+            }
 
             for (uint32_t j = 0; j < n_seq_id; ++j) {
                 llama_seq_id seq_id;
@@ -1235,7 +1397,42 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
 
 llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
+        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {
+    // snapshot-free rollback: the row holds the state through pos_commit; whatever each sequence has
+    // above it (pos - pos_commit tokens, sitting in the cell's pack rows) is replayed by this graph.
+    //  - armed (llama_rs_set_prefix): pack mode -- replay, commit after the prefix, keep this batch
+    //    uncommitted and pack its inputs (speculative / generation decodes)
+    //  - unarmed with pending tokens: replay, then commit through the end of this batch (the next
+    //    prompt on a reused slot, a prompt-cache or checkpoint restore)
+    // The armed value only selects the mode (one-shot). Per-sequence counts are graph INPUTS, not
+    // shapes, so sequences may differ and the graph is reused across rounds (rebuilding it
+    // whenever the accepted count changed cost 1.75 ms per round).
+    if (mem->pack_tokens > 0 && !this->ubatches.empty()) {
+        const auto & ub = this->ubatches[0];
+        pending.assign(ub.n_seqs, 0);
+        for (uint32_t s = 0; s < ub.n_seqs; ++s) {
+            const llama_seq_id seq     = ub.seq_id[s * ub.n_seq_tokens][0];
+            const int32_t      tail    = mem->cells[seq].tail;
+            const int32_t      pend_s  = tail >= 0 ? (int32_t) (mem->cells[tail].pos - mem->cells[tail].pos_commit) : 0;
+            const bool         armed_s = mem->prefix_n[seq] >= 0;
+            if (armed_s && mem->prefix_n[seq] != pend_s) {
+                LLAMA_LOG_DEBUG("%s: seq %d armed with n_prev %d but its cell holds %d pending tokens -- using the cell\n",
+                        __func__, seq, mem->prefix_n[seq], pend_s);
+            }
+            if (s == 0) {
+                pack_mode = armed_s;
+            } else {
+                GGML_ASSERT(armed_s == pack_mode && "prefix replay: every seq in the ubatch needs the same mode");
+            }
+            GGML_ASSERT(pend_s >= 0 && pend_s <= (int32_t) mem->pack_tokens);
+            pending[s] = pend_s;
+            mem->prefix_n[seq] = -1;
+        }
+        if (pack_mode) {
+            GGML_ASSERT(this->ubatches.size() == 1 && "prefix replay needs the batch in one ubatch");
+        }
+    }
+}
 
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
@@ -1260,7 +1457,9 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
+    mem->apply_n_prev = pack_mode ? 0 : -1; // find_slot: pack mode leaves this batch uncommitted
     mem->find_slot(ubatches[i_next]);
+    mem->apply_n_prev = -1;
 
     return true;
 }
@@ -1322,3 +1521,43 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
     return (int32_t)(idx * mem->size) + src0;
 }
+
+uint32_t llama_memory_recurrent_context::get_pack_tokens() const { return mem->pack_tokens; }
+int32_t  llama_memory_recurrent_context::get_rs_mode() const {
+    if (mem->pack_tokens == 0 || pending.empty()) {
+        return 0;
+    }
+    if (pack_mode) {
+        return 1;
+    }
+    if (i_next != 0) {
+        return 0; // later ubatches of a prefill see the row the first one committed
+    }
+    for (const int32_t p : pending) {
+        if (p > 0) {
+            return 2;
+        }
+    }
+    return 0;
+}
+int32_t  llama_memory_recurrent_context::get_pending(uint32_t s) const {
+    if (get_rs_mode() == 0 || s >= pending.size()) {
+        return 0;
+    }
+    return pending[s];
+}
+int64_t  llama_memory_recurrent_context::get_conv_window() const { return mem->conv_window; }
+int64_t  llama_memory_recurrent_context::get_pack_row_gdn() const { return mem->pack_row_gdn; }
+int64_t  llama_memory_recurrent_context::get_conv_channels() const { return mem->conv_channels; }
+ggml_tensor * llama_memory_recurrent_context::get_pk_l(int32_t il) const { return mem->pk_l.at(il); }
+ggml_tensor * llama_memory_recurrent_context::get_px_l(int32_t il) const { return mem->px_l.at(il); }
+
+void llama_memory_recurrent::rs_set_prefix(llama_seq_id seq_id, int32_t n_prev) {
+    if (pack_tokens == 0) {
+        return;
+    }
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < prefix_n.size());
+    GGML_ASSERT(n_prev <= (int32_t) pack_tokens);
+    prefix_n[seq_id] = n_prev;
+}
+

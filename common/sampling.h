@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -83,10 +84,42 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
+// Arm coupled (shared-noise) selection for speculative decoding. `pos0` is the absolute position
+// that draft[0] predicts; position i of the draft uses key(seed, seq_id, pos0 + i). The drafter must
+// arm the identical (seed, seq_id, pos0) or the two noise streams diverge.
+void common_sampler_set_coupled(struct common_sampler * gsmpl, bool enabled, uint32_t seed, int32_t seq_id, int32_t pos0);
+
+// Arm the chain for draft position `i` (relative to pos0). Callers that drive their own draft loop
+// (the drafters in common/speculative.cpp) use this; common_sampler_sample_and_accept_n does it
+// internally for the verify side.
+void common_sampler_arm_coupled(struct common_sampler * gsmpl, int32_t i);
+
+// the device draft chain: the coupled key arm_coupled(i) would use (0 when not coupled); whether
+// the sampler is the chain alone (no grammar, no reasoning budget); the chain run on the row's exact top-k candidates
+uint64_t    common_sampler_coupled_key(const struct common_sampler * gsmpl, int32_t i);
+bool        common_sampler_chain_only (const struct common_sampler * gsmpl);
+llama_token common_sampler_sample_topk(struct common_sampler * gsmpl, const llama_token_data * cands, size_t n);
+
+// Candidates come only from these token ids (ascending) instead of the whole vocabulary: for a reduced-vocabulary
+// draft head, whose graph writes -inf to every other logit, so the chain sees the same finite candidates without
+// building and sorting ~215k dead entries per call. Empty = the whole vocabulary. Backend-sampled rows are unaffected.
+// idx non-empty: the logits row is COMPACT (the draft head's own columns, XYZ2_COMPACT_LOGITS); ids[i] reads column idx[i].
+void common_sampler_set_vocab_subset(struct common_sampler * gsmpl, std::vector<llama_token> ids, std::vector<int32_t> idx = {});
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+
+// Speculative verify by block verification (Sun et al. 2403.10444, Alg. 2): draft[i] was DRAWN from dists[i] (ids
+// with probabilities). Lossless -- every returned token is an exact sample of the target's distribution after its chain
+// at idxs[i] -- and the kept prefix is the LONGEST whose block weight clears its uniform, not the first rejection's
+// (token-wise rejection reaches 1 - TV(p, q) per position; this keeps more). Returns a draft prefix plus one token.
+// Needs a chain that ends in a dist draw (temperature > 0, no mirostat).
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & dists,
+        std::mt19937 & rng, bool grammar_first = false);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
@@ -123,3 +156,24 @@ struct common_sampler_deleter {
 };
 
 typedef std::unique_ptr<common_sampler, common_sampler_deleter> common_sampler_ptr;
+
+// ---- xyz-engine: the server hands a response's speculative rounds to an external engine
+// (xyz_engine.dll) and walks each round's tokens through the slot's sampler afterwards
+// whether the target's chain is the one the engine reproduces: top_k 20 ahead of top_p 0.95, then dist; every other
+// sampler neutral (temperature 1, min_p 0, no penalties / dry / xtc / typical / top-n-sigma / mirostat / adaptive-p),
+// logit biases only -inf -- their ids (and the vocabulary's suppress tokens) in skip; why: the first reason it is not
+bool common_sampler_engine_ok(const struct common_sampler * gsmpl, const struct llama_vocab * vocab, std::vector<llama_token> & skip,
+                              std::string & why);
+// the reasoning budget: its state (common_reasoning_budget_state, -1 without one), the tokens left and the block's budget
+int  common_sampler_engine_budget(const struct common_sampler * gsmpl, int32_t * remaining, int32_t * budget);
+// whether common_sampler_sample keeps `id` drawn unconstrained: false only when the grammar applies and rejects it
+bool common_sampler_engine_grammar_ok(struct common_sampler * gsmpl, llama_token id);
+// n draws of the chain's dist rng (verify rows the engine decided with one candidate)
+void common_sampler_engine_dist_skip(struct common_sampler * gsmpl, int32_t n);
+// the rest of a plain coupled verify from draft position k (common_sampler_sample_and_accept_n from i = k) on the
+// engine's verify rows (rows[i]: row i, n_vocab floats; set_coupled first); the tokens it keeps are appended to out
+// the next draws read this logits row (n_vocab floats) instead of the context's outputs -- the prompt's output row the
+// engine computed (xe_prefill); nullptr clears it
+void common_sampler_set_row_override(struct common_sampler * gsmpl, const float * row);
+void common_sampler_engine_accept_from(struct common_sampler * gsmpl, struct llama_context * ctx, const float * const * rows,
+                                       int32_t k, const llama_tokens & draft, llama_tokens & out);

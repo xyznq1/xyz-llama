@@ -157,7 +157,7 @@ static const std::vector<std::string> quad = {
     "model-Q8_0.gguf",
     "mtp-model-Q8_0.gguf",
     "dflash-model-Q8_0.gguf",
-    "eagle3-model-Q8_0.gguf",
+    "xyz-model-Q8_0.gguf",
     "dspark-model-Q8_0.gguf",
 };
 
@@ -166,9 +166,9 @@ static const std::vector<std::string> dflash_only = {
     "dflash-model-Q8_0.gguf",
 };
 
-static const std::vector<std::string> eagle3_only = {
+static const std::vector<std::string> xyz_only = {
     "model-Q8_0.gguf",
-    "eagle3-model-Q8_0.gguf",
+    "xyz-model-Q8_0.gguf",
 };
 
 // a single full quant with dspark sidecars at other quants,
@@ -198,14 +198,14 @@ struct plan_case {
     const std::vector<std::string> files;
     const char * hf_repo;
     const char * hf_file;
-    bool sidecars;        // request mmproj + mtp + dflash + eagle3 + dspark
+    bool sidecars;        // request mmproj + mtp + dflash + xyz + dspark
     bool order_dependent; // the expected pick depends on the listing order
     const char * primary;
     std::vector<std::string> model_files;
     const char * mmproj;
     const char * mtp;
     const char * dflash;
-    const char * eagle3;
+    const char * xyz;
     const char * dspark;
 };
 
@@ -272,7 +272,7 @@ static const plan_case plan_cases[] = {
     // every sidecar type resolves at the tag
     {"quad exact tag", quad, "test/repo:Q8_0", "", true, false,
      "model-Q8_0.gguf", {"model-Q8_0.gguf"},
-     "", "mtp-model-Q8_0.gguf", "dflash-model-Q8_0.gguf", "eagle3-model-Q8_0.gguf", "dspark-model-Q8_0.gguf"},
+     "", "mtp-model-Q8_0.gguf", "dflash-model-Q8_0.gguf", "xyz-model-Q8_0.gguf", "dspark-model-Q8_0.gguf"},
 
     // no tag anchors the dspark sidecar on the only full quant
     {"spark default anchor", spark, "test/repo", "", true, false,
@@ -290,7 +290,7 @@ static void check_plan(const plan_case & c) {
     opts.download_mmproj = c.sidecars;
     opts.download_mtp    = c.sidecars;
     opts.download_dflash = c.sidecars;
-    opts.download_eagle3 = c.sidecars;
+    opts.download_xyz = c.sidecars;
     opts.download_dspark = c.sidecars;
 
     auto plan = common_download_get_hf_plan(model_ref(c.hf_repo, c.hf_file), opts);
@@ -299,7 +299,7 @@ static void check_plan(const plan_case & c) {
     REQUIRE_EQ(plan.mmproj.path,  c.mmproj);
     REQUIRE_EQ(plan.mtp.path,     c.mtp);
     REQUIRE_EQ(plan.dflash.path,  c.dflash);
-    REQUIRE_EQ(plan.eagle3.path,  c.eagle3);
+    REQUIRE_EQ(plan.xyz.path,  c.xyz);
     REQUIRE_EQ(plan.dspark.path,  c.dspark);
 
     // exact shard set, order insensitive; the primary must be the first split
@@ -368,7 +368,7 @@ static void test_task_assembly() {
     g_repos["test/hole"]   = hole;
     g_repos["test/quad"]   = quad;
     g_repos["test/dflash"] = dflash_only;
-    g_repos["test/eagle3"] = eagle3_only;
+    g_repos["test/xyz"] = xyz_only;
     g_repos["test/spark"]  = spark;
     g_repos["test/pair"]   = dspark_dflash;
     g_repos["test/small"]  = {"draft-model-Q4_K_M.gguf"};
@@ -428,11 +428,11 @@ static void test_task_assembly() {
         REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/dflash", "dflash-model-Q8_0.gguf"));
     }
     {
-        // auto-selection with only an eagle3 sidecar
+        // auto-selection with only an xyz sidecar
         common_params params;
-        assemble({"server", "-hf", "test/main:Q8_0", "-hfd", "test/eagle3:Q8_0"}, params);
-        REQUIRE(params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3});
-        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/eagle3", "eagle3-model-Q8_0.gguf"));
+        assemble({"server", "-hf", "test/main:Q8_0", "-hfd", "test/xyz:Q8_0"}, params);
+        REQUIRE(params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_XYZ});
+        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/xyz", "xyz-model-Q8_0.gguf"));
     }
     {
         // auto-selection prefers dspark over dflash when both ship

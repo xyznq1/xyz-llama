@@ -64,6 +64,15 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // xyzkv: get rotation tensors for pre-rotate-queries optimization
+    // Returns null for non-xyzkv memory types. Override in KV cache contexts.
+    virtual ggml_tensor * get_xyzkv_rot_forward() const { return nullptr; }
+    virtual ggml_tensor * get_xyzkv_rot_inverse() const { return nullptr; }
+
+    // xyzkv InnerQ: get per-channel scale_inv tensor for Q/V equalization
+    // Returns nullptr when InnerQ is not active. Override in KV cache contexts.
+    virtual ggml_tensor * get_xyzkv_innerq_scale_inv() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -107,9 +116,18 @@ struct llama_memory_i {
     // if data == true, the data buffers will also be cleared together with the metadata
     virtual void clear(bool data) = 0;
 
+    // (device KQ mask) a decode whose compute failed may have taken changed cells off the list its
+    // graph was to upload into a device mirror of the cells' positions -- forget what the mirror holds, so the next
+    // device mask uploads every cell. A no-op for memories without such a mirror.
+    virtual void pos_dev_invalidate() {}
+
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
+
+    // snapshot-free recurrent rollback -- arm the next decode's prefix replay on seq_id.
+    // No-op for memories without a recurrent part.
+    virtual void rs_set_prefix(llama_seq_id seq_id, int32_t n_prev) { (void) seq_id; (void) n_prev; }
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 

@@ -77,7 +77,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        qkv_mixed,
             int64_t              conv_kernel_size,
             int64_t              conv_channels,
-            int                  il);
+            int                  il,
+            int64_t *            n_prev_out = nullptr); // rs_replay: replayed conv steps in front of the output
 
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
@@ -1334,8 +1335,8 @@ struct llama_model_glm_dsa : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
-struct llama_model_eagle3 : public llama_model_base {
-    llama_model_eagle3(const struct llama_model_params & params) : llama_model_base(params) {}
+struct llama_model_xyz : public llama_model_base {
+    llama_model_xyz(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

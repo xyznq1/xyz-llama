@@ -191,6 +191,29 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// PQ2_0 uses the Q2_0 codec with one fp16 scale per 128 weights.
+#define QK_PQ2_0 128
+#define QI_PQ2_0 (QK_PQ2_0 / 32)
+#define QR_PQ2_0 1
+typedef struct {
+    ggml_half d;                // delta (scale) for all 128 weights
+    uint8_t   qs[QK_PQ2_0 / 4]; // 2 bits per element, 4 per byte
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
+
+// PTQ1_0 stores 128 ternary weights as 24 five-trit bytes, two four-trit bytes, then an fp16 scale.
+// Values are interleaved by trit so CPU and CUDA decoders must use the same staged order.
+#define QK_PTQ1_0 128
+#define QI_PTQ1_0 (QK_PTQ1_0 / 32)
+#define QR_PTQ1_0 1
+typedef struct {
+    uint8_t   qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 B, 5 trits per byte -> 120 values
+    uint8_t   qh[QK_PTQ1_0/64];                   //  2 B, 4 trits per byte ->   8 values
+    ggml_half d;                                  // scale, LAST
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5,
+              "wrong ptq1_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -286,6 +309,17 @@ typedef struct {
     ggml_half d;
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+
+// xyzkv 2-bit PolarQuant, one block per 128-value rotation group.
+#define QK_XYZKV2 128
+#define QK_XYZKV2_GROUP 128
+#define NL_XYZKV2     (QK_XYZKV2 / 16)
+#define NL_XYZKV2_VEC (QK_XYZKV2 / 4)
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_XYZKV2 / 4];
+} block_xyzkv2_0;
+static_assert(sizeof(block_xyzkv2_0) == sizeof(ggml_half) + QK_XYZKV2/4, "wrong xyzkv2_0 block size/padding");
 
 //
 // Super-block quantization structures

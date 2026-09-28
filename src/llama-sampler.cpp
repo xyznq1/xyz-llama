@@ -131,10 +131,30 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// descending logit as a TOTAL order: equal logits by ascending token id, NaN after every number. With `>` alone the
+// order of tied entries is unspecified, so a partial sort's top-k could depend on entries outside it (a draft sampler
+// that skips a head's -inf logits must pick exactly what the whole-vocabulary sort picks). Ascending id is also the
+// greedy sampler's tie rule (first maximum of an id-ordered array).
+// The common case (a smaller, b larger) still costs one float compare, so the whole-vocabulary sorts stay as fast.
+static inline bool llama_token_data_logit_desc(const llama_token_data & a, const llama_token_data & b) {
+    if (a.logit > b.logit) {
+        return true;
+    }
+    if (a.logit < b.logit) {
+        return false;
+    }
+    if (a.logit == b.logit) {
+        return a.id < b.id;
+    }
+    const bool a_nan = std::isnan(a.logit);   // unordered: at least one NaN
+    const bool b_nan = std::isnan(b.logit);
+    return a_nan != b_nan ? b_nan : a.id < b.id;
+}
+
 // writes result in res, does not mutate cur
 static void llama_token_data_array_partial_sort(const llama_token_data_array & cur, int npartial, std::vector<llama_token_data> & res) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return llama_token_data_logit_desc(a, b);
     };
 
     constexpr int   nbuckets     = 128;
@@ -151,7 +171,10 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
     bucket_idx.reserve(cur.size);
 
     for (int i = 0; i < (int)cur.size; ++i) {
-        const float val = cur.data[i].logit;
+        // clamp BEFORE the float -> int conversion (undefined for NaN / +-inf / out of range): NaN and -inf go to the
+        // lowest bucket, which matches their place in llama_token_data_logit_desc
+        const float v   = cur.data[i].logit;
+        const float val = std::isnan(v) ? bucket_low : std::min(std::max(v, bucket_low), bucket_high);
         int ib = int(bucket_scale * val + bucket_inter); //nbuckets * (val - bucket_low) / (bucket_high - bucket_low);
         ib = std::max(0, std::min(nbuckets - 1, ib));
         bucket_idx.push_back(ib);
@@ -192,7 +215,7 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
 static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return llama_token_data_logit_desc(a, b);
     };
 
     if (npartial <= 128) {
@@ -1132,6 +1155,10 @@ struct llama_sampler_dist : public llama_sampler_backend {
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
 
+    // coupled (shared-noise) selection -- see llama_sampler_dist_set_coupled
+    bool     coupled;
+    uint64_t coupled_key;
+
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
         seed_cur                  = src.seed_cur;
@@ -1139,8 +1166,62 @@ struct llama_sampler_dist : public llama_sampler_backend {
         rng_backend               = src.rng_backend;
         n_backend_draws_generated = src.n_backend_draws_generated;
         n_backend_draws_committed = src.n_backend_draws_committed;
+        coupled                   = src.coupled;
+        coupled_key               = src.coupled_key;
     }
 };
+
+// Coupled sampling: shared-noise selection for speculative decoding.
+//
+// THE PROBLEM. common_sampler_sample_and_accept_n accepts a drafted token only when it is exactly
+// equal to the token the target independently sampled. With a deterministic drafter (ours proposes
+// argmax q -- common/speculative.cpp:1361) that succeeds with probability p(x): the target's own
+// mass on that one token. At temperature 1.0 / top_k 20 / top_p 0.95 that averages 0.348, measured.
+// The shortfall is not drafter quality, it is that the two sides roll independent dice.
+//
+// THE FIX. Give both sides the SAME Gumbel noise, keyed by (seed, sequence, absolute position,
+// token id), and let each take argmax(log p + g) over its own candidate set. Two facts make this
+// work:
+//
+//   1. Gumbel-max is exact: argmax_v (log p(v) + g_v) with i.i.d. g ~ Gumbel(0,1) is a draw from p.
+//      The target's token is still a correct sample, so OUTPUT QUALITY IS UNCHANGED. This is not a
+//      quality-for-speed trade.
+//   2. The two sides now agree with probability sum_v min(p,q) = 1 - TV(p,q) instead of the
+//      independent-draw collision rate sum_v p(v)q(v). The first does not depend on how spread the
+//      target is, only on how well the drafter tracks it -- which is why this recovers acceptance
+//      at temperature 1.0 where exact matching collapses.
+//
+// Keying on the TOKEN ID (not the rank) is what makes it survive the drafter and target having
+// different candidate sets after their own top_k/top_p -- a shared-uniform CDF would be comparing
+// indices into two differently ordered lists and would be worthless here.
+//
+// Since log p(v) = logit(v) - max_logit - log(sum), and that offset is constant in v, argmax over
+// (logit + g) is the same selection without needing the softmax.
+static inline uint64_t llama_coupled_splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+// Gumbel(0,1) for one candidate. Computed in double so a future GPU implementation can reproduce
+// it closely enough that the argmax agrees; a one-ULP disagreement can only flip a near-tie, and
+// even then the target's draw remains a valid sample, so the failure mode is a slightly lower
+// acceptance rate and never a wrong token.
+static inline float llama_coupled_gumbel(uint64_t key, llama_token id) {
+    const uint64_t h = llama_coupled_splitmix64(key ^ llama_coupled_splitmix64((uint64_t) (uint32_t) id));
+
+    // (0,1) exclusive: the +0.5 keeps u away from 0 and 1 so the double log is finite
+    const double u = ((double) (h >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+
+    return (float) -log(-log(u));
+}
+
+uint64_t llama_sampler_coupled_key(uint32_t seed, int32_t seq_id, int32_t pos) {
+    return llama_coupled_splitmix64(
+            ((uint64_t) seed << 32) ^
+            llama_coupled_splitmix64(((uint64_t) (uint32_t) seq_id << 32) ^ (uint64_t) (uint32_t) pos));
+}
 
 static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
@@ -1181,6 +1262,29 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         float p = expf(cur_p->data[i].logit - max_l);
         cur_p->data[i].p = p;
         sum_cum += p;
+    }
+
+    if (ctx->coupled) {
+        // Shared-noise selection. Consumes no draw from ctx->rng on purpose: the whole point is
+        // that the randomness comes from the key, so that the drafter and the target -- which hold
+        // entirely separate samplers and RNG streams -- still land on the same token whenever their
+        // distributions agree.
+        size_t best_i = 0;
+        float  best_s = -INFINITY;
+
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const float s = cur_p->data[i].logit + llama_coupled_gumbel(ctx->coupled_key, cur_p->data[i].id);
+            if (s > best_s) {
+                best_s = s;
+                best_i = i;
+            }
+
+            cur_p->data[i].p /= sum_cum;
+        }
+
+        cur_p->selected = (int) best_i;
+
+        return;
     }
 
 #if 1
@@ -1245,6 +1349,8 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
         result_ctx->rng_backend               = ctx->rng_backend;
         result_ctx->n_backend_draws_generated = ctx->n_backend_draws_generated;
         result_ctx->n_backend_draws_committed = ctx->n_backend_draws_committed;
+        result_ctx->coupled                   = ctx->coupled;
+        result_ctx->coupled_key               = ctx->coupled_key;
     }
 
     return result;
@@ -1410,8 +1516,35 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .n_backend_draws_generated = */ 0,
             /* .n_backend_draws_committed = */ 0,
             /* .inp_uniforms              = */ {},
+            /* .coupled                   = */ false,
+            /* .coupled_key               = */ 0,
         }
     );
+}
+
+void llama_sampler_dist_set_coupled(struct llama_sampler * smpl, bool enabled, uint64_t key) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_dist_i) {
+        return;
+    }
+
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+
+    ctx->coupled     = enabled;
+    ctx->coupled_key = key;
+}
+
+void llama_sampler_dist_discard(struct llama_sampler * smpl, int32_t n) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_dist_i) {
+        return;
+    }
+
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+
+    // the one-candidate branch of llama_sampler_dist_apply, draw for draw
+    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+    for (int32_t i = 0; i < n; ++i) {
+        dist(ctx->rng);
+    }
 }
 
 void llama_sampler_backend_begin(llama_sampler * sampler) {

@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "xyzkv-quant.cuh"
 #include "convert.cuh"
 
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
@@ -21,6 +22,63 @@ static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const in
 
     v.x = (2*bit_0 - 1) * d;
     v.y = (2*bit_1 - 1) * d;
+}
+
+// PrismML PTQ1_0: decode ONE element by index out of the interleaved base-3 layout.
+//
+// Random access is the awkward case for this format -- the packed walk in vec_dot_ptq1_0_q8_1 gets the
+// trits in order for free, but get_rows needs element e directly. Mapping e back to (byte, trit):
+//     e <  80 : byte      e/16       , trit e%16 ... no -- trit = e/16, byte = e%16
+//     e < 120 : byte 16 + (e-80)%8   , trit (e-80)/8
+//     else    : qh[(e-120)%2]        , trit (e-120)/2
+// Decoding trit t of byte b is b*pow3[t], then ((q*3)>>8) recovers {0,1,2}.
+static __device__ __forceinline__ float ptq1_0_elem(const block_ptq1_0 * x, int e) {
+    const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    uint8_t b;
+    int t;
+    if (e < 80) {
+        t = e >> 4;             // e / 16
+        b = x->qs[e & 15];      // e % 16
+    } else if (e < 120) {
+        const int e2 = e - 80;
+        t = e2 >> 3;            // e2 / 8
+        b = x->qs[16 + (e2 & 7)];
+    } else {
+        const int e2 = e - 120;
+        t = e2 >> 1;            // e2 / 2
+        b = x->qh[e2 & 1];
+    }
+    const uint8_t q = b * pow3[t];
+    const int16_t xi = ((uint16_t) q * 3) >> 8;
+    return (float) (xi - 1);
+}
+
+static __device__ __forceinline__ void dequantize_ptq1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+    const float d = x[ib].d;
+    v.x = ptq1_0_elem(&x[ib], iqs)     * d;
+    v.y = ptq1_0_elem(&x[ib], iqs + 1) * d;
+}
+
+// PrismML PQ2_0: identical crumb decode to dequantize_q2_0 below; only the block type (and therefore
+// the 128-wide scale group) differs. Used by get_rows and the dequant fallbacks, not by MMVQ.
+static __device__ __forceinline__ void dequantize_pq2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_pq2_0 * x = (const block_pq2_0 *) vx;
+
+    const float d = x[ib].d;
+
+    // Stored code c in {0,1,2,3} maps to symbol s = c - 1 in {-1, 0, +1, +2}.
+    const int byte_index_0 = iqs / 4;
+    const int bit_offset_0 = (iqs % 4) * 2;
+
+    const int byte_index_1 = (iqs + 1) / 4;
+    const int bit_offset_1 = ((iqs + 1) % 4) * 2;
+
+    const int c0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 0x3;
+    const int c1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 0x3;
+
+    v.x = (c0 - 1) * d;
+    v.y = (c1 - 1) * d;
 }
 
 static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
@@ -449,4 +507,13 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
+}
+
+
+// Xyzkv2: 2-bit PolarQuant (2-bit qs only, no sign), block size 128
+static __device__ __forceinline__ void dequantize_xyzkv2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_xyzkv2_0 * x = (const block_xyzkv2_0 *) vx;
+    const float norm = __half2float(x[ib].norm);
+    v.x = xyzkv2_dequant_element(&x[ib], iqs + 0, norm);
+    v.y = xyzkv2_dequant_element(&x[ib], iqs + 1, norm);
 }

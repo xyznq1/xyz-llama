@@ -790,7 +790,7 @@ class DSparkModel(DFlashModel):
         if hparams is None:
             hparams = ModelBase.load_hparams(dir_model, False)
 
-        # EAGLE3-style exports use the 1+N bonus-anchor block, DFlash-lineage exports sample from the anchor
+        # XYZ-style exports use the 1+N bonus-anchor block, DFlash-lineage exports sample from the anchor
         self._sample_from_anchor = hparams.get(
             "sample_from_anchor",
             "transformer_layer_config" not in hparams and "aux_hidden_state_layer_ids" not in hparams)

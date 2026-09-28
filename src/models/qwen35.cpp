@@ -85,9 +85,11 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
         }
 
+        // gate THEN up: weights are placed in creation order, so the two land back to back and build_ffn runs them as
+        // one [gate; up] matmul (llama-graph.cpp, "MERGED GATE+UP"). Do not reorder.
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
     };
 
     auto load_block_mtp = [&](int il) {
@@ -207,6 +209,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
+    // "layer input n_layer" = the MTP block's input (xyz2 head feature 64): lets the generic layer-input capture
+    // serve it, identical to llama_get_embeddings_nextn()
+    if ((size_t) n_layer < res->t_layer_inp.size()) {
+        res->t_layer_inp[n_layer] = cur;
+    }
+
+    // FC FOLD: the drafter's feature fusion on the features this graph already holds (no-op unless
+    // llama_set_fc_fold registered one and this decode qualifies; see llm_graph_context::build_fc_fold)
+    build_fc_fold(cur);
 
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -231,11 +242,19 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    // expanded here, so the qkv and z matmuls (same activation, weights created back to back in
+    // load_arch_tensors) are ADJACENT nodes and the CUDA backend runs [wqkv; wqkv_gate] as one launch
+    // (ggml-cuda/mmvq.cu ggml_cuda_mul_mat_vec_q_ptq1_pair). Node order only; numerically identical.
+    ggml_build_forward_expand(gf, qkv_mixed);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
+    // expand z here so its matmul is scheduled next to the qkv projection instead of right
+    // before the gated output norm; the CUDA backend can then fuse RMS_NORM -> MUL(w) -> SILU(z) -> MUL into one
+    // launch (no compute node in between). Node order only; numerically identical.
+    ggml_build_forward_expand(gf, z);
 
     return { qkv_mixed, z };
 }
@@ -266,6 +285,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
 
+    // K and V are projected right after Q and the three are expanded in a row, so they are
+    // ADJACENT nodes over one activation with weights created back to back (create_tensor_qkv: wq, wk, wv) and the CUDA
+    // backend can run [wq; wk; wv] as one launch (ggml-cuda/mmvq.cu ggml_cuda_mul_mat_vec_q_ptq1_triple).
+    // Node order only; numerically identical.
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);
+
+    ggml_build_forward_expand(gf, Qcur_full);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, Vcur);
+
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
@@ -274,12 +307,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
-
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-    cb(Kcur, "Kcur", il);
-
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
-    cb(Vcur, "Vcur", il);
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -382,11 +409,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
-
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
+
+    int64_t n_prev_out = 0; // rs_replay: conv steps replayed in front of this batch's outputs
+    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il, &n_prev_out);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
@@ -399,25 +427,28 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // Calculate the total conv dimension
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+    // rs_replay: the conv output carries n_prev_out replayed steps first -- skip them in every view
+    const size_t nb3_qkv = (size_t) nb1_qkv * (n_seq_tokens + n_prev_out);
+    const size_t off_t   = (size_t) n_prev_out * nb1_qkv;
 
     // Extract the convolved Q, K, V from conv_output
     ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_k_dim),
             nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
+            nb3_qkv,
+            off_t);
 
     ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_k_dim),
             nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+            nb3_qkv,
+            off_t + head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
 
     ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_v_dim),
             nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+            nb3_qkv,
+            off_t + ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
 
     cb(q_conv, "q_conv", il);
     cb(k_conv, "k_conv", il);
@@ -425,8 +456,26 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    // one L2-norm launch for q and k instead of two. q and k are adjacent per token inside
+    // conv_qkv_mix, so a single [head_k_dim, 2*num_k_heads] view covers both; rows are normalised independently,
+    // hence bit-identical results. The fused GDN only needs contiguous rows and equal q/k strides, which the two
+    // views into the combined result satisfy. Saves n_layer_deltanet kernel launches per decode step.
+    ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb3_qkv,
+            off_t);
+    ggml_tensor * qk_norm = ggml_l2_norm(ctx0, qk_conv, eps_norm);
+    cb(qk_norm, "qk_conv_l2norm", il);
+    // expanded here, so the conv chain (conv-input concat, ssm_conv, silu, l2_norm) sits right after
+    // build_conv_state's gathers/copies. Left to the GDN's expansion, build_recurrent_attn's own build_rs gather
+    // (cache_pk, the replay pack) landed in between and the fused replay prologue
+    // (ggml-cuda.cu k_gdn_conv_replay) cannot claim a span holding another node. Node order only; numerically identical.
+    ggml_build_forward_expand(gf, qk_norm);
+    q_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], 0);
+    k_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], (size_t) num_k_heads * qk_norm->nb[1]);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -460,8 +509,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
 
-    // Reshape back to original dimensions
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    // Reshape back to original dimensions. with a single sequence the 3D result
+    // [n_embd, n_tokens, 1] already IS the 2D layout, and skipping the RESHAPE node lets the CUDA backend fuse the
+    // caller's residual ADD into this matmul (the matcher needs ADD->src[0] to be the MUL_MAT node itself).
+    if (n_seqs != 1) {
+        cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    }
 
     return cur;
 }
@@ -517,7 +570,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = build_embd_rows(tok_embd_w, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
