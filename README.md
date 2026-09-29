@@ -1,6 +1,6 @@
 # xyz
 
-Ternary Bonsai 2 27B with 160k context in about 8 GB of GPU memory, running at about 140 tokens/s on an RTX 4070 Ti SUPER.
+Ternary Bonsai 2 27B with 160k context in about 8 GB of GPU memory, running at about 150 tokens/s on an RTX 4070 Ti SUPER.
 
 Our main goal is less input for more output, lowering the bar to smarter models while keeping speeds high, a 27B with
 long context running fast on the kind of GPU people already have at home, not a data-center card.
@@ -11,8 +11,8 @@ cache so 160k context stays small, and our drafter, xyz v1.2, trained on the mod
 checks every token the drafter guesses, so you get the exact same text the model would write on its own, just faster.
 
 We measured it on an RTX 4070 Ti SUPER (16 GB, stock power limit) at around 161k context, temperature 1.0, top-k 20,
-top-p 0.95, over 10 generations (11,964 tokens): 139.5 tokens/s and 2.82 tokens per round. With `XYZ_ENGINE=1` it's
-144.2 tokens/s, same text.
+top-p 0.95, over 10 generations (11,964 tokens): 149.5 tokens/s and 2.82 tokens per round. With `XYZ_ENGINE=1` it's
+151.2 tokens/s, same text. Over 30 questions it's 2.92 tokens per round.
 
 ## What's in it
 
@@ -100,7 +100,7 @@ defaults, if you want something different just edit that command.
 
 - `XYZ_PC_DISK_DIR`, `XYZ_PC_DISK_GB`: an SSD tier for the prompt cache, prompts that fall out of RAM go to this folder
   (40 GB cap by default) and come back later without being processed again.
-- `XYZ_ENGINE=1`: runs the speculative rounds and prompt batches on xyz-engine (Windows, RTX 30 series or newer).
+- `XYZ_ENGINE=1`: runs the speculative rounds and prompt batches on xyz-engine (Windows, RTX 40 series).
   `xyz_engine.dll` and `expf_exc.bin` sit next to the server and get built with it. The startup log says
   `xyz-engine: ON`, or `OFF` and why. Anything the engine doesn't cover runs on the normal path.
 
@@ -111,12 +111,12 @@ defaults, if you want something different just edit that command.
 | GPU | RTX 4070 Ti SUPER 16 GB (sm_89), stock power limit |
 | System | Windows 11, 32 GB RAM |
 | Driver | 610.88, CUDA 13.3 |
-| Speed at around 161k context | 139.5 tokens/s, 144.2 with `XYZ_ENGINE=1` |
+| Speed at around 161k context | 149.5 tokens/s, 151.2 with `XYZ_ENGINE=1` |
 
 ## Notes
 
 - We tested on an RTX 4070 Ti SUPER (sm_89) with Windows 11 and CUDA 13.3. Other cards and Linux should work, we just
-  haven't tested them. xyz-engine is Windows only.
+  haven't tested them. xyz-engine is Windows and RTX 40 series only, other cards run the default path.
 - If it runs out of memory on startup, lower `-c` in the serve script.
 - If it doesn't start on the GPU, check your driver, `nvidia-smi` shows the CUDA version it supports on the top line
   ("CUDA Version" or "CUDA UMD Version", depends on the driver), it has to be 13 or higher.
