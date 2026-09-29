@@ -1,0 +1,64 @@
+name: Bug report
+description: Something broke, or it doesn't work the way the README says.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting. The more of this you fill in, the faster we can find it.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The first line of `llama-server --version`, or which release you downloaded.
+      placeholder: "version: 1.1.0 (build 3, commit 969b483)"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: Your GPU, and the driver and CUDA version from the top of `nvidia-smi`.
+      placeholder: RTX 4070 Ti SUPER 16 GB, driver 610.88, CUDA 13.3
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How you run it
+      options:
+        - The Windows zip (scripts\xyz-serve.cmd)
+        - Built from source (scripts/xyz-serve.sh or .cmd)
+        - My own llama-server command
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: xyz-engine
+      options:
+        - Off (the default)
+        - On (XYZ_ENGINE=1)
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log
+      description: The console output from the start up to the problem. It gets formatted as code, no backticks needed.
+      render: text
