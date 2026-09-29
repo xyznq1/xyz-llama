@@ -246,7 +246,7 @@ void Drafter::step(cudaStream_t st, int slot, int32_t tok, int32_t pos, const fl
     enum { SWIGLU = 2 };   // ggml_glu_op: REGLU 0, GEGLU 1, SWIGLU 2
 
     // embedding (the target's rotated table): rows, butterfly, signs
-    eng::get_rows_ptq1(st, tgt.get("token_embd.weight").data, 5120, tgt.hp.n_vocab, &in->tok, 1, emb);
+    eng::get_rows_ptq1(st, tgt.get("token_embd.weight").data, 5120, tgt.hp.n_vocab, &in->tok, 1, emb, tgt.get("token_embd.weight").ilv);
     eng::fwht_block(st, emb, emb_rot, 5, nullptr, 1, nullptr);
     k_mul_signs_d<<<20, 256, 0, st>>>(emb_rot, t_s5120, emb_s, 5120);
     // [enorm(emb) ; hnorm(g)] -> eh_proj
@@ -315,7 +315,7 @@ void Drafter::seed(cudaStream_t st, const int32_t * toks, int32_t pos0, const fl
 
     // embedding: rows, butterfly, signs; [enorm ; hnorm] -> eh_proj -- every matmul unfused, routed by m (mm_q: MMVQ
     // to 6 rows, MMQ above), the attention by m too (native q4_0 to 32 rows, the f16 tile above)
-    eng::get_rows_ptq1(st, tgt.get("token_embd.weight").data, E, tgt.hp.n_vocab, seed_dev->tok, m, emb);
+    eng::get_rows_ptq1(st, tgt.get("token_embd.weight").data, E, tgt.hp.n_vocab, seed_dev->tok, m, emb, tgt.get("token_embd.weight").ilv);
     eng::fwht_block(st, emb, emb_rot, (int64_t) 5*m, nullptr, 1, nullptr);
     k_mul_signs_rows<<<(E*m + 255)/256, 256, 0, st>>>(emb_rot, t_s5120, emb_s, E, m);
     eng::rms_norm_mul(st, emb_s, enorm, en, E, m, eps);
@@ -434,30 +434,13 @@ void Drafter::draft_graph(cudaStream_t st, const int32_t * toks, int32_t pos0, c
 struct PfBufs {
     int32_t * tok = nullptr, * pos = nullptr;
     int64_t * cell = nullptr;
-    half    * mask = nullptr;
     float * emb = nullptr, * emb_rot = nullptr, * emb_s = nullptr, * en = nullptr, * hn = nullptr, * cat = nullptr,
-          * fused = nullptr, * cur = nullptr, * qfull = nullptr, * q = nullptr, * qrot = nullptr, * k = nullptr, * kn = nullptr,
-          * krot = nullptr, * v = nullptr, * vrot = nullptr, * fa = nullptr, * fa_rot = nullptr, * gate_c = nullptr,
-          * gated = nullptr, * attn_o = nullptr, * ffn_inp = nullptr, * ffn_n = nullptr, * up = nullptr, * gt = nullptr,
-          * glu = nullptr, * dn = nullptr, * out = nullptr;
+          * fused = nullptr, * cur = nullptr, * k = nullptr, * kn = nullptr, * krot = nullptr, * v = nullptr, * vrot = nullptr;
 };
 
-// the SWA mask of a prompt-width decode from the uploaded table: cell j visible to row r iff 0 <= pos_j <= pos[r] and
-// pos[r] - pos_j < n_swa (the host mask's values, llama_kv_cache STANDARD window)
-static __global__ void k_pf_ring_mask(half * __restrict__ mask, const int32_t * __restrict__ tab, const int32_t * __restrict__ pos,
-                                      const int n_kv, const int n_swa) {
-    const int j = blockIdx.x*blockDim.x + threadIdx.x;
-    const int r = blockIdx.y;
-    if (j >= n_kv) {
-        return;
-    }
-    const int32_t pj = tab[j], p = pos[r];
-    mask[(int64_t) r*n_kv + j] = (pj >= 0 && pj <= p && p - pj < n_swa) ? __float2half(0.0f) : __float2half(-INFINITY);
-}
-
-// a catch-up decode of n prompt rows (2..512), as llama_decode(ctx_dft) runs one ubatch of them: the matmuls routed by
-// width (mm_q: MMVQ to 6 rows, MMQ above), the attention as fattn.cu routes it (flash_attn_q4_0_prompt: native q4_0 up
-// to 32 rows, the f16 tile above). One row is a different graph (the fused single-token decode) and is not taken.
+// a catch-up decode of n prompt rows (2..512), as llama_decode(ctx_dft) runs one ubatch of them, reduced to what it leaves
+// behind: the rows' K / V in the ring (the matmuls routed by width -- mm_q: MMVQ to 6 rows, MMQ above). One row is a
+// different graph (the fused single-token decode) and is not taken.
 void Drafter::prefill(cudaStream_t st, const int32_t * toks, const int32_t * pos, const float * g, const int n) {
     constexpr int N = 512;
     if (n < 2 || n > N) {
@@ -472,12 +455,9 @@ void Drafter::prefill(cudaStream_t st, const int32_t * toks, const int32_t * pos
         CK(cudaMalloc(&b.tok, N*sizeof(int32_t)));
         CK(cudaMalloc(&b.pos, N*sizeof(int32_t)));
         CK(cudaMalloc(&b.cell, N*sizeof(int64_t)));
-        CK(cudaMalloc(&b.mask, (size_t) kv_cells*N*sizeof(half)));
+        // only what the pass still runs (it stops at the K / V rows, see below)
         b.emb = f(E); b.emb_rot = f(E); b.emb_s = f(E); b.en = f(E); b.hn = f(E); b.cat = f(2*E); b.fused = f(E); b.cur = f(E);
-        b.qfull = f(12288); b.q = f(6144); b.qrot = f(6144); b.k = f(1024); b.kn = f(1024); b.krot = f(1024); b.v = f(1024);
-        b.vrot = f(1024); b.fa = f(6144); b.fa_rot = f(6144); b.gate_c = f(6144); b.gated = f(6144); b.attn_o = f(E);
-        b.ffn_inp = f(E); b.ffn_n = f(E); b.up = f((size_t) n_ff); b.gt = f((size_t) n_ff); b.glu = f((size_t) n_ff);
-        b.dn = f(E); b.out = f(E);
+        b.k = f(1024); b.kn = f(1024); b.krot = f(1024); b.v = f(1024); b.vrot = f(1024);
     }
     PfBufs & b = *pfb;
 
@@ -506,7 +486,7 @@ void Drafter::prefill(cudaStream_t st, const int32_t * toks, const int32_t * pos
 
     const size_t row = 1024/32*18;
     // embedding: rows, butterfly, signs; [enorm ; hnorm] -> eh_proj
-    eng::get_rows_ptq1(st, tgt.get("token_embd.weight").data, E, tgt.hp.n_vocab, b.tok, n, b.emb);
+    eng::get_rows_ptq1(st, tgt.get("token_embd.weight").data, E, tgt.hp.n_vocab, b.tok, n, b.emb, tgt.get("token_embd.weight").ilv);
     eng::fwht_block(st, b.emb, b.emb_rot, (int64_t) 5*n, nullptr, 1, nullptr);
     k_mul_signs_rows<<<(E*n + 255)/256, 256, 0, st>>>(b.emb_rot, t_s5120, b.emb_s, E, n);
     eng::rms_norm_mul(st, b.emb_s, enorm, b.en, E, n, eps);
@@ -514,10 +494,10 @@ void Drafter::prefill(cudaStream_t st, const int32_t * toks, const int32_t * pos
     k_concat_rows<<<(2*E*n + 255)/256, 256, 0, st>>>(b.en, b.hn, b.cat, E, n);
     eng::mm_q(st, t_q3k, eh_proj, b.cat, 2*E, E, n, b.fused, q8);
     eng::rms_norm_mul(st, b.fused, attn_norm, b.cur, E, n, eps);
-    // Q (with gate), K, V: MMQ, the fused norm + NEOX rope, the KV rotations, q4_0 rows into the ring's cells
-    eng::mm_q(st, t_q3k, wq, b.cur, E, 12288, n, b.qfull, q8);
-    eng::rms_norm_mul_rope(st, b.qfull, 512, 24, q_norm, eps, b.q, b.pos, 64, d.hp.rope_base, 262144, n, 12288);
-    eng::fwht_rows(st, b.q, b.qrot, 256, (int64_t) 24*n);
+    // K, V: MMQ, the fused norm + NEOX rope, the KV rotations, q4_0 rows into the ring's cells -- and nothing after them.
+    // A catch-up row's outputs are never read: drafting reseeds from the target's rows (xe_start.seed_g) and the pass
+    // leaves nothing but these K / V rows, so the Q projection, the attention, the output projection and the FFN it used
+    // to run for every prompt row were dead work -- and ~260 MiB of their buffers.
     eng::mm_q(st, t_q3k, wk, b.cur, E, 1024, n, b.k, q8);
     eng::rms_norm_mul_rope(st, b.k, 256, 4, k_norm, eps, b.kn, b.pos, 64, d.hp.rope_base, 262144, n, 1024);
     eng::fwht_rows(st, b.kn, b.krot, 256, (int64_t) 4*n);
@@ -525,20 +505,6 @@ void Drafter::prefill(cudaStream_t st, const int32_t * toks, const int32_t * pos
     eng::fwht_rows(st, b.v, b.vrot, 64, (int64_t) 16*n);
     eng::set_rows_q4_0(st, b.krot, 1024, n, b.cell, kc, (int64_t) row);
     eng::set_rows_q4_0(st, b.vrot, 1024, n, b.cell, vc, (int64_t) row);
-    // attention over the first n_kv cells (the SWA mask), inverse V rotation, gate
-    k_pf_ring_mask<<<dim3((n_kv + 255)/256, n), 256, 0, st>>>(b.mask, tab, b.pos, n_kv, n_swa);
-    eng::flash_attn_q4_0_prompt(st, b.qrot, n, 24, kc, vc, n_kv, kv_cells, b.mask, 1.0f/16.0f, b.fa);
-    eng::fwht_rows(st, b.fa, b.fa_rot, 64, (int64_t) 96*n);
-    k_gate_cont<<<24*n, 256, 0, st>>>(b.qfull, b.gate_c, 24*n);
-    eng::sigmoid_gate(st, b.gate_c, b.fa_rot, b.gated, 6144, n);
-    // out-projection + residual; FFN: gate, up, SWIGLU, down + residual
-    eng::mm_q(st, t_q3k, wo, b.gated, 6144, E, n, b.attn_o, q8);
-    k_add<<<(E*n + 255)/256, 256, 0, st>>>(b.attn_o, b.fused, b.ffn_inp, E*n);
-    eng::rms_norm_mul(st, b.ffn_inp, ffn_norm, b.ffn_n, E, n, eps);
-    eng::mm_q(st, t_q3k, ffn_gate, b.ffn_n, E, n_ff, n, b.gt, q8);
-    eng::mm_q(st, t_q3k, ffn_up, b.ffn_n, E, n_ff, n, b.up, q8);
-    eng::silu_gate(st, b.gt, b.up, b.glu, n_ff, n);
-    eng::mm_q(st, t_q3k, ffn_down, b.glu, n_ff, E, n, b.dn, q8);
-    k_add<<<(E*n + 255)/256, 256, 0, st>>>(b.dn, b.ffn_inp, b.out, E*n);
+    GGML_UNUSED(n_kv);
     CK(cudaGetLastError());
 }

@@ -28,6 +28,8 @@ struct Weight {
     size_t      nbytes = 0;
     void      * data = nullptr;   // device
     bool        bound = false;     // data is the host process's own tensor (bind mode), not the engine's
+    bool        ilv = true;        // PTQ1_0 rows in the fork's ILV16 order; false: the server's host table in file order,
+                                   // read in place through mapped memory (token_embd: only the gather reads it)
 };
 
 struct Hparams {
@@ -48,8 +50,10 @@ struct Model {
     std::unordered_map<std::string, Weight> w;
     DeviceArena arena;
     std::vector<float *> had_signs_dev;                        // one device sign vector per width (had_widths order)
-    // Every tensor the callback returns is the server's device copy; tensors kept on the host are loaded from the file.
+    // Every tensor the callback returns is the server's device copy; tensors kept on the host are loaded from the file --
+    // but the input embedding (llama keeps it on the host), which bind_lookup_host hands over to be read in place.
     std::function<const void *(const char * name)> bind_lookup;
+    std::function<const void *(const char * name)> bind_lookup_host;
     bool load(const char * path, cudaStream_t st);
     const Weight & get(const std::string & name) const;
     const Weight * find(const std::string & name) const;

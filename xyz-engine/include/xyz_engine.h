@@ -16,7 +16,8 @@ extern "C" {
 
 typedef struct xe_ctx xe_ctx;
 
-// The server's device pointer for a GGUF tensor of model 0 (target) or 1 (drafter), NULL if it lives on the host or is absent.
+// The server's device pointer for a GGUF tensor of model 0 (target) or 1 (drafter), NULL if it lives on the host or is absent;
+// model 2: the HOST pointer of a target tensor the server keeps on the host (the input embedding, read in place), else NULL.
 typedef const void * (*xe_tensor_fn)(void * user, int model, const char * name);
 
 struct xe_bind {

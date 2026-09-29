@@ -198,7 +198,9 @@ void draft_draw(cudaStream_t st, const float * logits, const int32_t * col_ids, 
                 const int32_t * step, int32_t * rec, int64_t rec_nb1, int32_t * col_out, int n, int top_k, float top_p);
 
 // ---- k_misc.cu (fork getrows.cu, norm.cu) ---------------------------------------------------------------------------
-void get_rows_ptq1(cudaStream_t st, const void * table, int64_t n_embd, int64_t n_rows, const int32_t * ids, int n, float * dst);
+// ilv = false: the table in file order (Weight::ilv -- the server's host table read in place)
+void get_rows_ptq1(cudaStream_t st, const void * table, int64_t n_embd, int64_t n_rows, const int32_t * ids, int n, float * dst,
+                   bool ilv = true);
 // rms_norm_f32<1024, true, false>: dst = rms_norm(x) * w, rows of ncols
 void rms_norm_mul(cudaStream_t st, const float * x, const float * w, float * dst, int ncols, int nrows, float eps);
 

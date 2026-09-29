@@ -185,12 +185,20 @@ bool Engine::prefill_init() {
     b->pos      = (int32_t *) pf_alloc(4*N*sizeof(int32_t));
     b->kv_idx   = (int64_t *) pf_alloc(N*sizeof(int64_t));
     b->mask_pos = (float *) pf_alloc(((size_t) N + kv_size)*sizeof(float));
-    b->emb = f(5120); b->xf = f(5120); b->x = f(5120); b->xr = f(5120); b->rot = f(5120); b->norm_out = f(5120); b->mm_out = f(5120);
-    b->a_raw = f(48); b->b_raw = f(48); b->gate = f(48); b->beta = f(48);
-    b->xbf = (__nv_bfloat16 *) pf_alloc((size_t) 5120*N*sizeof(__nv_bfloat16));
-    b->qkv = f(10240); b->z = f(6144); b->conv_silu = f(10240); b->qk_norm = f(4096); b->gdn_out = f(6144); b->rot6k = f(6144);
-    b->q_full = f(12288); b->k_cur = f(1024); b->v_cur = f(1024); b->qa = f(6144); b->fa_out = f(6144);
-    b->ffn_g = f(17408); b->ffn_u = f(17408); b->glu = f(17408); b->glu_rot = f(17408);
+    b->emb = f(5120); b->xf = f(5120); b->x = f(5120); b->xr = f(5120); b->rot = f(5120); b->mm_out = f(5120);
+    // ONE scratch region for a layer's intermediates: the prompt path is one stream, a layer is GDN or attention, and both
+    // sets are dead once their output matmul has written mm_out -- the FFN's four then take the same bytes. 149,184 ->
+    // 69,632 floats per token (-155 MiB at 512-token ubatches); the same values in other places. rot6k sits at one offset
+    // for both branches.
+    float * R = f(4*17408);
+    const auto at = [&](int64_t off) { return R + off*N; };
+    b->ffn_g = at(0); b->ffn_u = at(17408); b->glu = at(2*17408); b->glu_rot = at(3*17408);
+    b->norm_out = at(0);
+    b->xbf = (__nv_bfloat16 *) at(5120);                      // 5120 bf16 per token = 2560 floats
+    b->a_raw = at(7680); b->b_raw = at(7728); b->gate = at(7776); b->beta = at(7824);
+    b->qkv = at(7872); b->z = at(18112); b->conv_silu = at(24256); b->qk_norm = at(34496); b->gdn_out = at(38592);
+    b->q_full = at(0); b->k_cur = at(12288); b->v_cur = at(13312); b->qa = at(14336); b->fa_out = at(20480);
+    b->rot6k = at(44736);                                      // GDN's set ends at 50,880 floats, attention's at 26,624
     b->h = f(5120); b->fold_in = f(5120);
     b->mask16 = (half *) pf_alloc((size_t) 16*kv_size*sizeof(half));
     b->fold_cat_s = (float *) pf_alloc((size_t) 10240*16*sizeof(float));
@@ -263,7 +271,7 @@ bool Engine::prefill_ubatch(const int32_t * tokens, const int n, const bool want
     };
 
     // embedding: rows of the rotated table, butterfly, then signs
-    eng::get_rows_ptq1(st, tok_embd, 5120, hp.n_vocab, b.tok, n, b.emb);
+    eng::get_rows_ptq1(st, tok_embd, 5120, hp.n_vocab, b.tok, n, b.emb, tok_ilv);
     eng::fwht_block(st, b.emb, b.xf, (int64_t) 5*n, nullptr, 1, nullptr);
     k_pf_mul_signs<<<(unsigned) ((5120LL*n + 255)/256), 256, 0, st>>>(b.xf, s5120, b.x, 5120, 5120LL*n);
 
@@ -358,7 +366,7 @@ bool Engine::prefill_small(const int32_t * tokens, const int n, const bool want_
         }
     }
 
-    eng::get_rows_ptq1(st, tok_embd, 5120, hp.n_vocab, b.tok, n, b.emb);
+    eng::get_rows_ptq1(st, tok_embd, 5120, hp.n_vocab, b.tok, n, b.emb, tok_ilv);
     eng::fwht_block(st, b.emb, b.xf, (int64_t) 5*n, nullptr, 1, nullptr);
     k_pf_mul_signs<<<(unsigned) ((5120LL*n + 255)/256), 256, 0, st>>>(b.xf, s5120, b.x, 5120, 5120LL*n);
 

@@ -46,6 +46,31 @@ static __global__ void k_ptq1_ilv_pack_tile(uint32_t * __restrict__ data, const 
     }
 }
 
+// a host range the device reads in place: the device alias of pinned + mapped memory (the server's pinned buffer), else
+// its pages registered read-only and mapped; nullptr when neither works (the caller copies the tensor instead)
+static void * map_host(const void * p, const size_t bytes) {
+    cudaPointerAttributes a = {};
+    if (cudaPointerGetAttributes(&a, p) == cudaSuccess && a.type == cudaMemoryTypeHost && a.devicePointer != nullptr) {
+        return a.devicePointer;
+    }
+    (void) cudaGetLastError();
+    const uintptr_t page = 4096;
+    const uintptr_t lo   = (uintptr_t) p & ~(page - 1);
+    const uintptr_t hi   = ((uintptr_t) p + bytes + page - 1) & ~(page - 1);
+    const cudaError_t e = cudaHostRegister((void *) lo, hi - lo, cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    if (e != cudaSuccess && e != cudaErrorHostMemoryAlreadyRegistered) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    (void) cudaGetLastError();
+    void * d = nullptr;
+    if (cudaHostGetDevicePointer(&d, const_cast<void *>(p), 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return d;
+}
+
 static void ptq1_ilv_pack(const Weight & t, cudaStream_t st) {
     const int     S      = (int) (t.ne[0] / QK_PTQ1_0);
     const int64_t ntiles = t.ne[1] / 16;
@@ -157,9 +182,19 @@ bool Model::load(const char * path, cudaStream_t st) {
         ggml_tensor * t = ggml_get_tensor(meta, gguf_get_tensor_name(g, i));
         Weight & wt = ws[i];
         const void * bp = bind_lookup(t->name);
+        void * mapped = nullptr;
+        if (bp == nullptr && bind_lookup_host && t->type == GGML_TYPE_PTQ1_0 && strcmp(t->name, "token_embd.weight") == 0) {
+            if (const void * hp_ptr = bind_lookup_host(t->name)) {
+                mapped = map_host(hp_ptr, ggml_nbytes(t));
+            }
+        }
         if (bp != nullptr) {
             wt.data  = const_cast<void *>(bp);
             wt.bound = true;
+        } else if (mapped != nullptr) {   // 0.26 GiB of VRAM the engine used to copy the table into
+            wt.data  = mapped;
+            wt.bound = true;
+            wt.ilv   = false;
         } else {
             total += (ggml_nbytes(t) + 255) / 256 * 256;
         }

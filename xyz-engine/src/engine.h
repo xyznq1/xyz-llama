@@ -79,6 +79,7 @@ struct Engine {
     std::vector<Layer> L;
     const float * s5120 = nullptr, * s6144 = nullptr, * s17408 = nullptr;
     const void * tok_embd = nullptr, * w_out = nullptr;
+    bool tok_ilv = true;   // false: tok_embd is the server's host table read in place, file order (model.h Weight::ilv)
     const float * out_norm = nullptr;
     eng::MRope rope = {};
 
@@ -115,6 +116,11 @@ struct Engine {
     // everything else a pass varies (tokens, positions, replay counts, cache rows) is read from in_dev
     std::unordered_map<int64_t, cudaGraphExec_t> graphs;
     int n_captures = 0;
+    // ... held to the 12 launched most recently: an instantiated pass graph holds ~11 MiB of device memory and every
+    // 256-cell n_kv bucket a reply crosses brings new ones -- kept forever, VRAM grew for the process's life. Replies
+    // move forward through the buckets, so the least recently used are dead weight; a re-capture gives the same bytes.
+    std::unordered_map<int64_t, uint64_t> graph_used;   // key -> the stamp of its last launch
+    uint64_t graph_clock = 0;
 
     // THE PROMPT PATH (prefill.cu): ubatches of 17..pf_nmax tokens as the server's prompt graph runs them (MMQ matmuls,
     // cuBLAS bf16 gates, the conv chain, the positional-mask attention). prefill_ubatch processes n tokens at positions

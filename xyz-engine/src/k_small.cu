@@ -15,6 +15,9 @@ namespace eng {
 namespace {
 
 // row ids[i] of an [n_embd, n_rows] PTQ1_0 table into dst row i; thread pairs as the fork's grid
+// ilv = false: the table in file order (the server's host copy read in place, model.cu map_host) -- the same blocks, the
+// same values, a different address
+template <bool ilv>
 __global__ void k_embed_ptq1(const block_ptq1_0 * __restrict__ table, const int32_t * __restrict__ ids,
                              float * __restrict__ dst, const int64_t n_embd, const int64_t n_rows) {
     ggml_cuda_pdl_sync();
@@ -23,7 +26,7 @@ __global__ void k_embed_ptq1(const block_ptq1_0 * __restrict__ table, const int3
     const int64_t row = ids[i10];
     float * d = dst + (int64_t) i10*n_embd;
     for (int64_t i00 = 2*(blockIdx.y*blockDim.x + threadIdx.x); i00 < n_embd; i00 += gridDim.y*blockDim.x) {
-        const block_ptq1_0 * x = table + ptq1_block(row, i00/QK_PTQ1_0, stride_row, n_rows);
+        const block_ptq1_0 * x = table + (ilv ? ptq1_block(row, i00/QK_PTQ1_0, stride_row, n_rows) : row*stride_row + i00/QK_PTQ1_0);
         const int iqs = i00 % QK_PTQ1_0;
         const float s = x->d;
         d[i00 + 0] = ptq1_elem(x, iqs)     * s;
@@ -226,11 +229,16 @@ __global__ void k_gate(const float * __restrict__ gate, const float * __restrict
 
 } // namespace
 
-void get_rows_ptq1(cudaStream_t st, const void * table, int64_t n_embd, int64_t n_rows, const int32_t * ids, int n, float * dst) {
+void get_rows_ptq1(cudaStream_t st, const void * table, int64_t n_embd, int64_t n_rows, const int32_t * ids, int n, float * dst,
+                   bool ilv) {
     constexpr int BS = 256;
     const int ny = (int) ((n_embd + 2*BS - 1) / (2*BS));
-    k_embed_ptq1<<<dim3((unsigned) n, (unsigned) MIN(ny, UINT16_MAX), 1), dim3(BS, 1, 1), 0, st>>>(
-        (const block_ptq1_0 *) table, ids, dst, n_embd, n_rows);
+    const dim3 grid((unsigned) n, (unsigned) MIN(ny, UINT16_MAX), 1);
+    if (ilv) {
+        k_embed_ptq1<true><<<grid, dim3(BS, 1, 1), 0, st>>>((const block_ptq1_0 *) table, ids, dst, n_embd, n_rows);
+    } else {
+        k_embed_ptq1<false><<<grid, dim3(BS, 1, 1), 0, st>>>((const block_ptq1_0 *) table, ids, dst, n_embd, n_rows);
+    }
 }
 
 void rms_norm_mul(cudaStream_t st, const float * x, const float * w, float * dst, int ncols, int nrows, float eps) {

@@ -112,6 +112,7 @@ bool Engine::init(cudaStream_t stream) {
     rope = eng::mrope_params(hp.rope_dims, sections, GGML_ROPE_TYPE_IMROPE, 262144, hp.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
     tok_embd = m.get("token_embd.weight").data;
+    tok_ilv  = m.get("token_embd.weight").ilv;
     w_out    = m.get("output.weight").data;
     out_norm = (const float *) m.get("output_norm.weight").data;
 
@@ -196,7 +197,9 @@ bool Engine::set_fold(const void * w, int type, int layer) {
     CK(cudaMalloc(&g_rows, (size_t) 5120*T*sizeof(float)));
     CK(cudaMalloc(&q8f, (size_t) 1 << 18));
     fc_w = w; fc_type = type; fc_layer = layer;
-    graphs.clear();   // captured passes do not have it
+    for (auto & kv : graphs) CK(cudaGraphExecDestroy(kv.second));   // captured passes do not have it
+    graphs.clear();
+    graph_used.clear();
     return true;
 }
 
@@ -239,6 +242,18 @@ void Engine::pass(const int32_t * tokens, int pending, int width) {
     const int64_t key = ((int64_t) n_kv*8 + w)*2 + par;
     auto it = graphs.find(key);
     if (it == graphs.end()) {
+        if (graphs.size() >= 12) {   // evict the least recently launched (engine.h graph_used)
+            auto lru = graph_used.begin();
+            for (auto u = graph_used.begin(); u != graph_used.end(); ++u) {
+                if (u->second < lru->second) {
+                    lru = u;
+                }
+            }
+            CK(cudaStreamSynchronize(st));   // its last launch may still run
+            CK(cudaGraphExecDestroy(graphs.at(lru->first)));
+            graphs.erase(lru->first);
+            graph_used.erase(lru);
+        }
         cudaGraph_t g = nullptr;
         CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed));
         issue(n_kv, par);
@@ -249,6 +264,7 @@ void Engine::pass(const int32_t * tokens, int pending, int width) {
         it = graphs.emplace(key, ge).first;
         n_captures++;
     }
+    graph_used[key] = ++graph_clock;
     CK(cudaGraphLaunch(it->second, st));
     n_past += w;
     pass_no++;
@@ -258,7 +274,7 @@ void Engine::issue(const int n_kv, const int par) {
     const Hparams & hp = m.hp;
 
     // embedding: rows of the rotated table, butterfly, then signs
-    eng::get_rows_ptq1(st, tok_embd, 5120, hp.n_vocab, in_dev->tokens, Tw, emb);
+    eng::get_rows_ptq1(st, tok_embd, 5120, hp.n_vocab, in_dev->tokens, Tw, emb, tok_ilv);
     eng::fwht_block(st, emb, xf, (int64_t) 5*Tw, nullptr, 1, nullptr);
     k_mul_signs<<<(5120*Tw + 255)/256, 256, 0, st>>>(xf, s5120, x, 5120, 5120*Tw);
     k_kq_mask<<<(n_kv + 255)/256, 256, 0, st>>>(mask, in_dev, Tw);

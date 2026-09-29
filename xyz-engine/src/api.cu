@@ -40,6 +40,8 @@ XE_API xe_ctx * xe_create(const xe_bind * b) {
     CK(cudaStreamCreateWithFlags(&c->st, cudaStreamNonBlocking));
     c->tgt.bind_lookup = [b](const char * nm) { return b->tensor(b->user, 0, nm); };
     c->dm.bind_lookup  = [b](const char * nm) { return b->tensor(b->user, 1, nm); };
+    // model 2: the host pointer of a target tensor llama keeps on the host -- the input embedding, read in place
+    c->tgt.bind_lookup_host = [b](const char * nm) { return b->tensor(b->user, 2, nm); };
     if (!c->tgt.load(b->target_gguf, c->st) || !c->dm.load(b->drafter_gguf, c->st)) {
         return nullptr;
     }
@@ -88,6 +90,7 @@ XE_API void xe_rebind_rs(xe_ctx * c, float * const * conv, float * const * ssm, 
     if (moved) {   // the captured passes hold the old rows
         for (auto & kv : c->e->graphs) CK(cudaGraphExecDestroy(kv.second));
         c->e->graphs.clear();
+        c->e->graph_used.clear();
     }
 }
 

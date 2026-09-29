@@ -3282,6 +3282,10 @@ private:
 
     static const void * engine_tensor(void * user, int model, const char * name) {
         auto * self = (server_context_impl *) user;
+        if (model == 2) {   // a target tensor llama keeps on the host (the input embedding): the engine reads it in place
+            const ggml_tensor * t = llama_model_tensor_ext(self->model_tgt, name);
+            return t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer) ? t->data : nullptr;
+        }
         const ggml_tensor * t = llama_model_tensor_ext(model == 0 ? self->model_tgt : self->model_dft, name);
         if (t == nullptr || t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
             return nullptr;
