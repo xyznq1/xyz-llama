@@ -703,7 +703,9 @@ void ptq1_matmul(cudaStream_t st, const void * w, const void * q8, int K, int nr
     // v1 (U 2, 5 CTAs/SM) where it measured fastest (down, qkv, the heads); U 1 everywhere else: never slower than v2 there
     // (RTX 4070 Ti SUPER, width 5: qkvz 33.8 vs 34.8 us, out-proj 15.4 vs 16.4, gate_up equal) and 212 vs 263 instructions per
     // block, which is clock on a power-capped card. Every variant is bit-identical.
-    const int variant = (nrows == 5120 && K == 17408) ? 1 : (nrows == 14336 || nrows > 65536 ? 1 : 0);
+    // FFN down (35.8 vs 35.8 us) and the 248k-row head (459.8 vs 458.8) tie at width 5, so they take U 1 as well; qkv keeps
+    // v1 (29.7 vs 30.7 us).
+    const int variant = nrows == 14336 ? 1 : 0;
     ptq1_own(st, w, q8, K, nrows, ncols, dst, dst_stride, variant, hi, hi_row0, hi_stride, hi2, hi2_row0, hi2_stride);
 }
 
