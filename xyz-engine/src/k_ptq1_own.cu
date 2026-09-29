@@ -27,22 +27,33 @@ struct Act {
     half2 dsb[4];
 };
 
-static __device__ __forceinline__ void load_act(Act & a, const block_q8_1 * __restrict__ y, const int stride_col_y,
-                                                const int kb, const int g, const int c, const int ncols) {
-    const int colB = g;
-    const int colC = 2*c;
-    int4 lo = make_int4(0, 0, 0, 0), hi = make_int4(0, 0, 0, 0), za = make_int4(0, 0, 0, 0), zb = make_int4(0, 0, 0, 0);
-    if (colB < ncols) {
-        const char * rb = (const char *) (y + colB*stride_col_y + kb*(QK_PTQ1_0/QK8_1));
-        lo = *(const int4 *) (rb + 32*c);
-        hi = *(const int4 *) (rb + 32*c + 16);
-    }
-    if (colC < ncols) {
-        za = *(const int4 *) ((const char *) (y + colC*stride_col_y + kb*(QK_PTQ1_0/QK8_1)) + 4*QK8_1);
-    }
-    if (colC + 1 < ncols) {
-        zb = *(const int4 *) ((const char *) (y + (colC + 1)*stride_col_y + kb*(QK_PTQ1_0/QK8_1)) + 4*QK8_1);
-    }
+// A lane's three activation streams (its B column's fragment words, its two C columns' (d, -sum q) pairs) at k-block 0,
+// set up once per kernel. A column past ncols reads column 0 of y instead of branching around its loads: its B and C
+// columns only reach outputs the store loop skips (col >= ncols), so every stored value is unchanged.
+struct ActPtr {
+    const char * b;
+    const char * c0;
+    const char * c1;
+};
+
+// col0: the n-tile's first column; the fallback is column 0 of y itself, never a column past the buffer
+static __device__ __forceinline__ ActPtr act_ptr(const block_q8_1 * __restrict__ y, const int stride_col_y, const int col0,
+                                                 const int g, const int c, const int ncols) {
+    const int colB = col0 + g;
+    const int colC = col0 + 2*c;
+    ActPtr p;
+    p.b  = (const char *) (y + (colB     < ncols ? colB     : 0)*stride_col_y) + 32*c;
+    p.c0 = (const char *) (y + (colC     < ncols ? colC     : 0)*stride_col_y) + 4*QK8_1;
+    p.c1 = (const char *) (y + (colC + 1 < ncols ? colC + 1 : 0)*stride_col_y) + 4*QK8_1;
+    return p;
+}
+
+static __device__ __forceinline__ void load_act(Act & a, const ActPtr & p, const int kb) {
+    const size_t off = (size_t) kb*((QK_PTQ1_0/QK8_1)*sizeof(block_q8_1));   // one ptq1_perm record per k-block
+    const int4 lo = *(const int4 *) (p.b + off);
+    const int4 hi = *(const int4 *) (p.b + off + 16);
+    const int4 za = *(const int4 *) (p.c0 + off);
+    const int4 zb = *(const int4 *) (p.c1 + off);
     a.bw[0] = lo.x; a.bw[1] = lo.y; a.bw[2] = lo.z; a.bw[3] = lo.w;
     a.bw[4] = hi.x; a.bw[5] = hi.y; a.bw[6] = hi.z; a.bw[7] = hi.w;
     memcpy(a.dsa, &za, sizeof(za));
@@ -140,6 +151,7 @@ static __global__ void k_ptq1_own(const void * __restrict__ vx, const void * __r
     const block_ptq1_0 * xa = (const block_ptq1_0 *) vx + oa;
     const block_ptq1_0 * xb = (const block_ptq1_0 *) vx + ob;
     const block_q8_1 *   y  = (const block_q8_1 *) vy;
+    const ActPtr         ap = act_ptr(y, stride_col_y, 0, g, c, ncols);
 
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     // U blocks per iteration: kb = kb0 + u*nwarps
@@ -152,7 +164,7 @@ static __global__ void k_ptq1_own(const void * __restrict__ vx, const void * __r
             if (kb < nblocks) {
                 wa[u] = ptq1_load_words(xa + kb*kstep, c);
                 wb[u] = ptq1_load_words(xb + kb*kstep, c);
-                load_act(act[u], y, stride_col_y, kb, g, c, ncols);
+                load_act(act[u], ap, kb);
             }
         }
         float blk[U][4];
@@ -339,6 +351,11 @@ static __global__ void k_ptq1_own_nt(const void * __restrict__ vx, const void * 
     const block_ptq1_0 * xa = (const block_ptq1_0 *) vx + oa;
     const block_ptq1_0 * xb = (const block_ptq1_0 *) vx + ob;
     const block_q8_1 *   y  = (const block_q8_1 *) vy;
+    ActPtr ap[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        ap[nt] = act_ptr(y, stride_col_y, nt*8, g, c, ncols);
+    }
 
     float acc[NT][4] = {{0.0f}};
     for (int kb = w; kb < nblocks; kb += nwarps) {
@@ -347,7 +364,7 @@ static __global__ void k_ptq1_own_nt(const void * __restrict__ vx, const void * 
         Act act[NT];
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
-            load_act(act[nt], y + nt*8*stride_col_y, stride_col_y, kb, g, c, ncols - nt*8);
+            load_act(act[nt], ap[nt], kb);
         }
         ptq1_frag fx;
         ptq1_decode_words<isum>(wa, wb, c, fx);
