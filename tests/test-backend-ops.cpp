@@ -10569,6 +10569,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // PTQ1_0: the ILV16 tensor-core kernels for 1..32 columns -- whole and partial 16-row tiles, the verify widths and the
+    // fused gate/up path
+    for (int64_t m : {16, 40, 64, 1000, 5120}) {
+        for (int64_t k : {128, 384, 1024, 5120}) {
+            for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 17, 32}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    for (int64_t n : {1, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, n, 256, {2, 1}, {2, 1}));
+    }
+    for (int64_t tokens : {1, 2, 4, 5, 8}) {
+        for (int64_t rows : {32, 40, 1040}) {
+            for (bool with_bias : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, tokens, rows, 1024,
+                    false, 1, 1, false, with_bias, true, false, {1, 1}));
+            }
+        }
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
