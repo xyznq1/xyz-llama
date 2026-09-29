@@ -53,50 +53,56 @@ static __device__ __forceinline__ uint32_t ptq1_walk_next(uint32_t & lo, uint32_
     return __byte_perm(wl, wh, 0x7531);
 }
 
+// Trit t of each byte of a walk pair (lo, hi) directly: byte 1 of each 16-bit half of ((x * 3^t) & 0x00FF00FF) * 3 is the
+// walk's (t+1)-th output without the t steps before it (b * 3^t <= 255 * 81 < 2^16: no half carries into the next).
+// Bytes 0/1 take ml = 3^t, bytes 2/3 mh, so the two halves can take different trits.
+static __device__ __forceinline__ uint32_t ptq1_trit_at(const uint32_t lo, const uint32_t hi, const uint32_t ml,
+                                                         const uint32_t mh) {
+    return __byte_perm(((lo*ml) & 0x00FF00FFu)*3, ((hi*mh) & 0x00FF00FFu)*3, 0x7531);
+}
+
 // The 16 A registers (4 slices x {x0..x3}) one lane needs from its two rows' blocks, as signed int8x4.
 struct ptq1_frag {
     int s[4][4];
 };
 
+// Row r's 8 A registers (r = 0: row g, x0/x2; r = 1: row g+8, x1/x3) from its words q = qs[4c..4c+3] (elements t*16 + 4c
+// + j), t = qs[16+4(c&1)..] (elements 80 + t*8 + 4(c&1) + j) and hd = qh[0] | qh[1] << 8 | d << 16 (element 120 + 2t + h =
+// trit t of qh[h]). Slices 0-2 walk all 5 trits of q. The tail extracts only the trits this lane uses: lanes 0/1 trits 0,
+// 2, 4 of t; lanes 2/3 trits 1, 3 of t and the qh trits 0-1 (lane 2) or 2-3 (lane 3). The lane picks multipliers and
+// sources, not results, so there is no divergence and no work for trits it drops.
+template <bool digits>
+static __device__ __forceinline__ void ptq1_decode_row(const uint32_t q, const uint32_t t, const uint32_t hd, const int c,
+                                                       const int r, ptq1_frag & f) {
+    const bool upper = c >= 2;
+    uint32_t ql, qhi, tl, thi;
+    ptq1_walk_init(q, ql, qhi);
+    ptq1_walk_init(t, tl, thi);
+    const uint32_t q0 = ptq1_walk_next(ql, qhi);
+    const uint32_t q1 = ptq1_walk_next(ql, qhi);
+    const uint32_t q2 = ptq1_walk_next(ql, qhi);
+    const uint32_t q3 = ptq1_walk_next(ql, qhi);
+    const uint32_t q4 = ptq1_walk_next(ql, qhi);
+    const uint32_t v  = (hd & 0xFFu) | ((hd & 0xFF00u) << 8);   // qh[0], qh[1] as the two halves of a walk pair
+    const uint32_t e0 = ptq1_trit_at(tl, thi, upper ? 3u : 1u, upper ? 3u : 1u);
+    const uint32_t e1 = ptq1_trit_at(tl, thi, upper ? 27u : 9u, upper ? 27u : 9u);
+    const uint32_t e2 = ptq1_trit_at(upper ? v : tl, upper ? v : thi,
+                                     upper ? (c == 2 ? 1u : 9u) : 81u, upper ? (c == 2 ? 3u : 27u) : 81u);
+    f.s[0][0 + r] = ptq1_a4<digits>(q0);   // k  0..15: trit 0
+    f.s[0][2 + r] = ptq1_a4<digits>(q1);   // k 16..31: trit 1
+    f.s[1][0 + r] = ptq1_a4<digits>(q2);
+    f.s[1][2 + r] = ptq1_a4<digits>(q3);
+    f.s[2][0 + r] = ptq1_a4<digits>(q4);   // k 64..79
+    f.s[2][2 + r] = ptq1_a4<digits>(e0);   // k 80..95: tail trit c>>1
+    f.s[3][0 + r] = ptq1_a4<digits>(e1);   // k 96..111: tail trit 2 + (c>>1)
+    f.s[3][2 + r] = ptq1_a4<digits>(e2);   // k 112..127: tail trit 4, or the qh trits
+}
+
 template <bool digits = false>   // Raw 0..2 digits or signed -1..1 weights.
 static __device__ __forceinline__ void ptq1_decode_rows(const block_ptq1_0 * __restrict__ ba, const block_ptq1_0 * __restrict__ bb,
                                                         const int c, ptq1_frag & f) {
-    const block_ptq1_0 * rows[2] = { ba, bb };
-#pragma unroll
-    for (int r = 0; r < 2; ++r) {                         // r = 0: row g (x0/x2), r = 1: row g+8 (x1/x3)
-        const block_ptq1_0 * b = rows[r];
-        uint32_t ql, qhi, tl, thi;
-        ptq1_walk_init(get_int_b4(b->qs, c), ql, qhi);          // qs[4c..4c+3]: elements t*16 + 4c + j
-        ptq1_walk_init(get_int_b4(b->qs + 16, c & 1), tl, thi); // qs[16+4(c&1)..]: elements 80 + t*8 + 4(c&1) + j
-        const uint32_t qhd = (uint32_t) get_int_b4(b, 6);       // qh[0] | qh[1] << 8 (then d, unused here)
-        const uint32_t q0 = ptq1_walk_next(ql, qhi);
-        const uint32_t q1 = ptq1_walk_next(ql, qhi);
-        const uint32_t q2 = ptq1_walk_next(ql, qhi);
-        const uint32_t q3 = ptq1_walk_next(ql, qhi);
-        const uint32_t q4 = ptq1_walk_next(ql, qhi);
-        const uint32_t u0 = ptq1_walk_next(tl, thi);
-        const uint32_t u1 = ptq1_walk_next(tl, thi);
-        const uint32_t u2 = ptq1_walk_next(tl, thi);
-        const uint32_t u3 = ptq1_walk_next(tl, thi);
-        const uint32_t u4 = ptq1_walk_next(tl, thi);
-        // qh: element 120 + 2t + h = trit t of qh[h]; lane 2 takes t 0-1 (120..123), lane 3 t 2-3 (124..127)
-        uint32_t v = (qhd & 0xFFu) | ((qhd & 0xFF00u) << 8);
-        const uint32_t h0 = v * 3; v = h0 & 0x00FF00FFu;
-        const uint32_t h1 = v * 3; v = h1 & 0x00FF00FFu;
-        const uint32_t h2 = v * 3; v = h2 & 0x00FF00FFu;
-        const uint32_t h3 = v * 3;
-        const uint32_t qh01 = __byte_perm(h0, h1, 0x7531);
-        const uint32_t qh23 = __byte_perm(h2, h3, 0x7531);
-        const bool upper = c >= 2;
-        f.s[0][0 + r] = ptq1_a4<digits>(q0);                                   // k  0..15: trit 0
-        f.s[0][2 + r] = ptq1_a4<digits>(q1);                                   // k 16..31: trit 1
-        f.s[1][0 + r] = ptq1_a4<digits>(q2);
-        f.s[1][2 + r] = ptq1_a4<digits>(q3);
-        f.s[2][0 + r] = ptq1_a4<digits>(q4);                                   // k 64..79
-        f.s[2][2 + r] = ptq1_a4<digits>(upper ? u1 : u0);                      // k 80..95: tail trit c>>1
-        f.s[3][0 + r] = ptq1_a4<digits>(upper ? u3 : u2);                      // k 96..111: tail trit 2 + (c>>1)
-        f.s[3][2 + r] = ptq1_a4<digits>(!upper ? u4 : (c == 2 ? qh01 : qh23)); // k 112..127
-    }
+    ptq1_decode_row<digits>(get_int_b4(ba->qs, c), get_int_b4(ba->qs + 16, c & 1), get_int_b4(ba, 6), c, 0, f);
+    ptq1_decode_row<digits>(get_int_b4(bb->qs, c), get_int_b4(bb->qs + 16, c & 1), get_int_b4(bb, 6), c, 1, f);
 }
 
 struct ptq1_words {
@@ -119,39 +125,8 @@ static __device__ __forceinline__ float ptq1_word_scale(const uint32_t hd) {
 template <bool digits = false>
 static __device__ __forceinline__ void ptq1_decode_words(const ptq1_words & wa, const ptq1_words & wb, const int c,
                                                          ptq1_frag & f) {
-    const ptq1_words rows[2] = { wa, wb };
-#pragma unroll
-    for (int r = 0; r < 2; ++r) {
-        uint32_t ql, qhi, tl, thi;
-        ptq1_walk_init(rows[r].q, ql, qhi);
-        ptq1_walk_init(rows[r].t, tl, thi);
-        const uint32_t q0 = ptq1_walk_next(ql, qhi);
-        const uint32_t q1 = ptq1_walk_next(ql, qhi);
-        const uint32_t q2 = ptq1_walk_next(ql, qhi);
-        const uint32_t q3 = ptq1_walk_next(ql, qhi);
-        const uint32_t q4 = ptq1_walk_next(ql, qhi);
-        const uint32_t u0 = ptq1_walk_next(tl, thi);
-        const uint32_t u1 = ptq1_walk_next(tl, thi);
-        const uint32_t u2 = ptq1_walk_next(tl, thi);
-        const uint32_t u3 = ptq1_walk_next(tl, thi);
-        const uint32_t u4 = ptq1_walk_next(tl, thi);
-        uint32_t v = (rows[r].hd & 0xFFu) | ((rows[r].hd & 0xFF00u) << 8);
-        const uint32_t h0 = v * 3; v = h0 & 0x00FF00FFu;
-        const uint32_t h1 = v * 3; v = h1 & 0x00FF00FFu;
-        const uint32_t h2 = v * 3; v = h2 & 0x00FF00FFu;
-        const uint32_t h3 = v * 3;
-        const uint32_t qh01 = __byte_perm(h0, h1, 0x7531);
-        const uint32_t qh23 = __byte_perm(h2, h3, 0x7531);
-        const bool upper = c >= 2;
-        f.s[0][0 + r] = ptq1_a4<digits>(q0);
-        f.s[0][2 + r] = ptq1_a4<digits>(q1);
-        f.s[1][0 + r] = ptq1_a4<digits>(q2);
-        f.s[1][2 + r] = ptq1_a4<digits>(q3);
-        f.s[2][0 + r] = ptq1_a4<digits>(q4);
-        f.s[2][2 + r] = ptq1_a4<digits>(upper ? u1 : u0);
-        f.s[3][0 + r] = ptq1_a4<digits>(upper ? u3 : u2);
-        f.s[3][2 + r] = ptq1_a4<digits>(!upper ? u4 : (c == 2 ? qh01 : qh23));
-    }
+    ptq1_decode_row<digits>(wa.q, wa.t, wa.hd, c, 0, f);
+    ptq1_decode_row<digits>(wb.q, wb.t, wb.hd, c, 1, f);
 }
 
 // Choose the kernel and activation layout together.
