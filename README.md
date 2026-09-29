@@ -2,8 +2,8 @@
 
 Ternary Bonsai 2 27B with 160k context in about 8 GB of GPU memory, running at about 140 tokens/s on an RTX 4070 Ti SUPER.
 
-What we're after is lowering the bar to smarter models, a 27B with long context on the kind of GPU people already have at
-home, not a data-center card.
+Our main goal is less input for more output, lowering the bar to smarter models, a 27B with long context on the kind of
+GPU people already have at home, not a data-center card.
 
 We forked [llama.cpp](https://github.com/ggml-org/llama.cpp) and built what PrismML's 1.75-bit Ternary Bonsai 2 27B
 (Qwen3.8-27B, `PTQ1_0`) needs to run fast at long context, our own CUDA kernels for the ternary weights, a 2-bit KV
