@@ -27,13 +27,15 @@ struct xe_ctx {
 extern "C" {
 
 XE_API xe_ctx * xe_create(const xe_bind * b) {
-    // the attention stages the KV cache through cp.async: sm_80 (RTX 30-series) or newer
+    // RTX 40 series (sm_89) only: that's where we proved the engine's text is the default path's, word for word. On an
+    // RTX 3080 Ti the text differed (and it was no faster), so everything else runs the default path, which is exact.
     int dev = 0, cc_major = 0, cc_minor = 0;
     CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev));
     CK(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev));
-    if (cc_major < 8) {
-        fprintf(stderr, "xyz-engine: needs an sm_80 or newer GPU (RTX 30-series and up), this one is sm_%d%d\n", cc_major, cc_minor);
+    if (cc_major != 8 || cc_minor != 9) {
+        fprintf(stderr, "xyz-engine: only verified on RTX 40 series (sm_89), this GPU is sm_%d%d -- the default path runs\n",
+                cc_major, cc_minor);
         return nullptr;
     }
     auto c = std::make_unique<xe_ctx>();
