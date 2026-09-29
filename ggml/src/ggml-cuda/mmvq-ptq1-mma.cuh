@@ -37,28 +37,24 @@ static __device__ __forceinline__ int ptq1_neg_isum(const half2 ds) {
     return (int) __half_as_short(__high2half(ds));
 }
 
-// Successive trits of the 4 bytes of one word: bytes 0,1 in the 16-bit halves of lo, 2,3 in hi (b*3 <= 765 never
-// crosses a half). ptq1_walk_next returns trit t of each byte, packed in byte order, and advances t. (Free functions,
-// not a struct: MSVC's host pass parses constructor bodies and has no __byte_perm.)
+// The 4 bytes of one word as a pair of 16-bit-half words: bytes 0,1 in lo, 2,3 in hi. (Free functions, not a struct:
+// MSVC's host pass parses constructor bodies and has no __byte_perm.)
 static __device__ __forceinline__ void ptq1_walk_init(const uint32_t packed, uint32_t & lo, uint32_t & hi) {
     lo = __byte_perm(packed, 0, 0x4140);
     hi = __byte_perm(packed, 0, 0x4342);
 }
 
-static __device__ __forceinline__ uint32_t ptq1_walk_next(uint32_t & lo, uint32_t & hi) {
-    const uint32_t wl = lo * 3;
-    const uint32_t wh = hi * 3;
-    lo = wl & 0x00FF00FFu;
-    hi = wh & 0x00FF00FFu;
-    return __byte_perm(wl, wh, 0x7531);
+// Q = floor(b*m/256) of each byte of a pair, packed in byte order: byte 1 of each 16-bit half of lo*m, hi*m (b*m <= 255*243
+// < 2^16: no half carries into the next).
+static __device__ __forceinline__ uint32_t ptq1_q_at(const uint32_t lo, const uint32_t hi, const uint32_t m) {
+    return __byte_perm(lo*m, hi*m, 0x7531);
 }
 
-// Trit t of each byte of a walk pair (lo, hi) directly: byte 1 of each 16-bit half of ((x * 3^t) & 0x00FF00FF) * 3 is the
-// walk's (t+1)-th output without the t steps before it (b * 3^t <= 255 * 81 < 2^16: no half carries into the next).
-// Bytes 0/1 take ml = 3^t, bytes 2/3 mh, so the two halves can take different trits.
-static __device__ __forceinline__ uint32_t ptq1_trit_at(const uint32_t lo, const uint32_t hi, const uint32_t ml,
-                                                         const uint32_t mh) {
-    return __byte_perm(((lo*ml) & 0x00FF00FFu)*3, ((hi*mh) & 0x00FF00FFu)*3, 0x7531);
+// Trit t of a byte b is Q_t - 3*Q_{t-1} with Q_t = floor(b*3^(t+1)/256): b*3^(t+1) = 768*Q_{t-1} + 3*(b*3^t mod 256), and
+// the reference decode's trit is floor(3*(b*3^t mod 256)/256). Every result byte is 0..2, so one packed multiply-add makes
+// four trits with no borrows.
+static __device__ __forceinline__ uint32_t ptq1_q_trit(const uint32_t q, const uint32_t q_prev) {
+    return q - 3*q_prev;
 }
 
 // The 16 A registers (4 slices x {x0..x3}) one lane needs from its two rows' blocks, as signed int8x4.
@@ -68,7 +64,7 @@ struct ptq1_frag {
 
 // Row r's 8 A registers (r = 0: row g, x0/x2; r = 1: row g+8, x1/x3) from its words q = qs[4c..4c+3] (elements t*16 + 4c
 // + j), t = qs[16+4(c&1)..] (elements 80 + t*8 + 4(c&1) + j) and hd = qh[0] | qh[1] << 8 | d << 16 (element 120 + 2t + h =
-// trit t of qh[h]). Slices 0-2 walk all 5 trits of q. The tail extracts only the trits this lane uses: lanes 0/1 trits 0,
+// trit t of qh[h]). Slices 0-2 take all 5 trits of q. The tail extracts only the trits this lane uses: lanes 0/1 trits 0,
 // 2, 4 of t; lanes 2/3 trits 1, 3 of t and the qh trits 0-1 (lane 2) or 2-3 (lane 3). The lane picks multipliers and
 // sources, not results, so there is no divergence and no work for trits it drops.
 template <bool digits>
@@ -78,24 +74,33 @@ static __device__ __forceinline__ void ptq1_decode_row(const uint32_t q, const u
     uint32_t ql, qhi, tl, thi;
     ptq1_walk_init(q, ql, qhi);
     ptq1_walk_init(t, tl, thi);
-    const uint32_t q0 = ptq1_walk_next(ql, qhi);
-    const uint32_t q1 = ptq1_walk_next(ql, qhi);
-    const uint32_t q2 = ptq1_walk_next(ql, qhi);
-    const uint32_t q3 = ptq1_walk_next(ql, qhi);
-    const uint32_t q4 = ptq1_walk_next(ql, qhi);
-    const uint32_t v  = (hd & 0xFFu) | ((hd & 0xFF00u) << 8);   // qh[0], qh[1] as the two halves of a walk pair
-    const uint32_t e0 = ptq1_trit_at(tl, thi, upper ? 3u : 1u, upper ? 3u : 1u);
-    const uint32_t e1 = ptq1_trit_at(tl, thi, upper ? 27u : 9u, upper ? 27u : 9u);
-    const uint32_t e2 = ptq1_trit_at(upper ? v : tl, upper ? v : thi,
-                                     upper ? (c == 2 ? 1u : 9u) : 81u, upper ? (c == 2 ? 3u : 27u) : 81u);
-    f.s[0][0 + r] = ptq1_a4<digits>(q0);   // k  0..15: trit 0
-    f.s[0][2 + r] = ptq1_a4<digits>(q1);   // k 16..31: trit 1
-    f.s[1][0 + r] = ptq1_a4<digits>(q2);
-    f.s[1][2 + r] = ptq1_a4<digits>(q3);
-    f.s[2][0 + r] = ptq1_a4<digits>(q4);   // k 64..79
-    f.s[2][2 + r] = ptq1_a4<digits>(e0);   // k 80..95: tail trit c>>1
-    f.s[3][0 + r] = ptq1_a4<digits>(e1);   // k 96..111: tail trit 2 + (c>>1)
-    f.s[3][2 + r] = ptq1_a4<digits>(e2);   // k 112..127: tail trit 4, or the qh trits
+    const uint32_t Q0 = ptq1_q_at(ql, qhi, 3);
+    const uint32_t Q1 = ptq1_q_at(ql, qhi, 9);
+    const uint32_t Q2 = ptq1_q_at(ql, qhi, 27);
+    const uint32_t Q3 = ptq1_q_at(ql, qhi, 81);
+    const uint32_t Q4 = ptq1_q_at(ql, qhi, 243);
+    // the tail's Q_{e-1}, Q_e, Q_{e+1}, Q_{e+2} for e = c >> 1 (a multiplier of 3^0 makes Q_{-1} = 0)
+    const uint32_t m0  = upper ? 3u : 1u;
+    const uint32_t tl0 = tl*m0;
+    const uint32_t th0 = thi*m0;
+    const uint32_t P0  = __byte_perm(tl0, th0, 0x7531);
+    const uint32_t P1  = ptq1_q_at(tl0, th0, 3);
+    const uint32_t P2  = ptq1_q_at(tl0, th0, 9);
+    const uint32_t P3  = ptq1_q_at(tl0, th0, 27);
+    // the last slice as X - 3Y: lanes 0/1 Q_4, Q_3 of t; lane 2 Q_0/Q_1 and Q_-1/Q_0 of the qh pair, lane 3 Q_2/Q_3, Q_1/Q_2
+    const uint32_t v  = __byte_perm(hd, 0, 0x4140);   // qh[0], qh[1] as the two halves of a pair
+    const uint32_t a1 = (upper ? v : tl)  * (upper ? (c == 2 ? 1u : 9u)  : 81u);
+    const uint32_t a2 = (upper ? v : thi) * (upper ? (c == 2 ? 3u : 27u) : 81u);
+    const uint32_t X  = ptq1_q_at(a1, a2, 3);
+    const uint32_t Y  = __byte_perm(a1, a2, 0x7531);
+    f.s[0][0 + r] = ptq1_a4<digits>(Q0);                    // k  0..15: trit 0
+    f.s[0][2 + r] = ptq1_a4<digits>(ptq1_q_trit(Q1, Q0));   // k 16..31: trit 1
+    f.s[1][0 + r] = ptq1_a4<digits>(ptq1_q_trit(Q2, Q1));
+    f.s[1][2 + r] = ptq1_a4<digits>(ptq1_q_trit(Q3, Q2));
+    f.s[2][0 + r] = ptq1_a4<digits>(ptq1_q_trit(Q4, Q3));   // k 64..79
+    f.s[2][2 + r] = ptq1_a4<digits>(ptq1_q_trit(P1, P0));   // k 80..95: tail trit c>>1
+    f.s[3][0 + r] = ptq1_a4<digits>(ptq1_q_trit(P3, P2));   // k 96..111: tail trit 2 + (c>>1)
+    f.s[3][2 + r] = ptq1_a4<digits>(ptq1_q_trit(X, Y));     // k 112..127: tail trit 4, or the qh trits
 }
 
 template <bool digits = false>   // Raw 0..2 digits or signed -1..1 weights.
