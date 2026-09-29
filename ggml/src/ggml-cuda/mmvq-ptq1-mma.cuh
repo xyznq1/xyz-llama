@@ -193,64 +193,73 @@ static __device__ __forceinline__ void mul_mat_ptq1_mma_tile(
     const int  oa       = tile_ilv ? row0*stride_row_x + g     : ra*stride_row_x;
     const int  ob       = tile_ilv ? row0*stride_row_x + g + 8 : rb*stride_row_x;
     const int x_off = sample_x*stride_sample_x + channel_x*stride_channel_x;
-    const block_ptq1_0 * xa = (const block_ptq1_0 *) vx + x_off + oa;
-    const block_ptq1_0 * xb = (const block_ptq1_0 *) vx + x_off + ob;
+    // every pointer starts at this warp's first k-block and steps by a constant, so the loop does no address math
+    const int xstep = nwarps*kstep;
+    const block_ptq1_0 * xa = (const block_ptq1_0 *) vx + x_off + oa + w*kstep;
+    const block_ptq1_0 * xb = (const block_ptq1_0 *) vx + x_off + ob + w*kstep;
     [[maybe_unused]] const block_ptq1_0 * ga = nullptr;
     [[maybe_unused]] const block_ptq1_0 * gb = nullptr;
     [[maybe_unused]] bool use_gate = false;
     if constexpr (has_fusion) {
         use_gate = fusion.gate != nullptr;
         if (use_gate) {
-            ga = (const block_ptq1_0 *) fusion.gate + x_off + oa;
-            gb = (const block_ptq1_0 *) fusion.gate + x_off + ob;
+            ga = (const block_ptq1_0 *) fusion.gate + x_off + oa + w*kstep;
+            gb = (const block_ptq1_0 *) fusion.gate + x_off + ob + w*kstep;
         }
     }
     const block_q8_1 * y = (const block_q8_1 *) vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+    // lane (g, c): its B column's 8 fragment words (2 x 16 B at yb) and its two C columns' 4 (d, sum) pairs (16 B at yc0,
+    // yc1), from the permuted record of each k-block (quantize.cu: word c*8 + 2s + h = bytes 16h+4c.. of block s; ds at
+    // +128). A column past ncols_dst reads column 0 instead: its B and C columns only reach outputs that are never stored.
+    constexpr int ystep = nwarps*(QK_PTQ1_0/QK8_1)*(int) sizeof(block_q8_1);
+    const char * yb[ntiles];
+    const char * yc0[ntiles];
+    const char * yc1[ntiles];
+#pragma unroll
+    for (int nt = 0; nt < ntiles; ++nt) {
+        const int colB = nt*8 + g;
+        const int colC = nt*8 + 2*c;
+        const block_q8_1 * yk = y + w*(QK_PTQ1_0/QK8_1);
+        yb[nt]  = (const char *) (yk + (colB     < ncols_dst ? colB     : 0)*stride_col_y) + 32*c;
+        yc0[nt] = (const char *) (yk + (colC     < ncols_dst ? colC     : 0)*stride_col_y) + 4*QK8_1;
+        yc1[nt] = (const char *) (yk + (colC + 1 < ncols_dst ? colC + 1 : 0)*stride_col_y) + 4*QK8_1;
+    }
 
     float acc[ntiles][4]  = {{0.0f}};
     [[maybe_unused]] float accg[ntiles][4] = {{0.0f}};
 
     for (int kb = w; kb < nblocks; kb += nwarps) {
-        const block_ptq1_0 * pa = xa + kb*kstep;
-        const block_ptq1_0 * pb = xb + kb*kstep;
         ptq1_frag fx;
-        ptq1_decode_rows<true>(pa, pb, c, fx);
-        const float da = ptq1_word_scale((uint32_t) get_int_b4(pa, 6));
-        const float db = ptq1_word_scale((uint32_t) get_int_b4(pb, 6));
+        ptq1_decode_rows<true>(xa, xb, c, fx);
+        const float da = ptq1_word_scale((uint32_t) get_int_b4(xa, 6));
+        const float db = ptq1_word_scale((uint32_t) get_int_b4(xb, 6));
         [[maybe_unused]] ptq1_frag fg;
         [[maybe_unused]] float dga = 0.0f, dgb = 0.0f;
         if constexpr (has_fusion) {
             if (use_gate) {
-                const block_ptq1_0 * pga = ga + kb*kstep;
-                const block_ptq1_0 * pgb = gb + kb*kstep;
-                ptq1_decode_rows<true>(pga, pgb, c, fg);
-                dga = __half2float(pga->d);
-                dgb = __half2float(pgb->d);
+                ptq1_decode_rows<true>(ga, gb, c, fg);
+                dga = __half2float(ga->d);
+                dgb = __half2float(gb->d);
+                ga += xstep;
+                gb += xstep;
             }
         }
+        xa += xstep;
+        xb += xstep;
         float blk[ntiles][4]  = {{0.0f}};
         [[maybe_unused]] float blkg[ntiles][4] = {{0.0f}};
-        // lane (g, c): its B column's 8 fragment words (2 x 16 B) and its two C columns' 4 (d, sum) pairs (16 B each), all
-        // from the permuted record of k-block kb (quantize.cu: word c*8 + 2s + h = bytes 16h+4c.. of block s; ds at +128)
         int   bw[ntiles][8];
         half2 dsa[ntiles][4];
         half2 dsb[ntiles][4];
 #pragma unroll
         for (int nt = 0; nt < ntiles; ++nt) {
-            const int colB = nt*8 + g;
-            const int colC = nt*8 + 2*c;
-            int4 lo = make_int4(0, 0, 0, 0), hi = make_int4(0, 0, 0, 0), za = make_int4(0, 0, 0, 0), zb = make_int4(0, 0, 0, 0);
-            if (colB < ncols_dst) {
-                const char * rb = (const char *) (y + colB*stride_col_y + kb*(QK_PTQ1_0/QK8_1));
-                lo = *(const int4 *) (rb + 32*c);
-                hi = *(const int4 *) (rb + 32*c + 16);
-            }
-            if (colC < ncols_dst) {
-                za = *(const int4 *) ((const char *) (y + colC*stride_col_y + kb*(QK_PTQ1_0/QK8_1)) + 4*QK8_1);
-            }
-            if (colC + 1 < ncols_dst) {
-                zb = *(const int4 *) ((const char *) (y + (colC + 1)*stride_col_y + kb*(QK_PTQ1_0/QK8_1)) + 4*QK8_1);
-            }
+            const int4 lo = *(const int4 *) (yb[nt]);
+            const int4 hi = *(const int4 *) (yb[nt] + 16);
+            const int4 za = *(const int4 *) (yc0[nt]);
+            const int4 zb = *(const int4 *) (yc1[nt]);
+            yb[nt]  += ystep;
+            yc0[nt] += ystep;
+            yc1[nt] += ystep;
             bw[nt][0] = lo.x; bw[nt][1] = lo.y; bw[nt][2] = lo.z; bw[nt][3] = lo.w;
             bw[nt][4] = hi.x; bw[nt][5] = hi.y; bw[nt][6] = hi.z; bw[nt][7] = hi.w;
             memcpy(dsa[nt], &za, sizeof(za));
