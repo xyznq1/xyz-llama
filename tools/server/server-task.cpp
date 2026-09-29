@@ -1909,7 +1909,28 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    // an entry over the limit keeps its NEWEST checkpoints that fit instead of being dropped whole: at 160k the
+    // recurrent checkpoints (~151 MiB each on Bonsai 2) are about half an entry, and a restore that needs an older one
+    // re-reads from the nearest kept one, so a trimmed entry only saves time
+    const size_t base_size = state_size_tgt + state_size_dft;
+    size_t       n_keep    = prompt.checkpoints.size();
+    if (limit_size > 0 && base_size + checkpoints_size > limit_size && base_size <= limit_size) {
+        size_t kept = 0;
+        n_keep = 0;
+        for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
+            if (base_size + kept + it->size() > limit_size) {
+                break;
+            }
+            kept += it->size();
+            ++n_keep;
+        }
+        SRV_WRN(" - prompt state %.3f MiB is over the cache size limit %.3f MiB: keeping the newest %zu of %zu checkpoints\n",
+                (base_size + checkpoints_size) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), n_keep,
+                prompt.checkpoints.size());
+        checkpoints_size = kept;
+    }
+
+    const size_t state_size_new = base_size + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -1963,7 +1984,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::list<common_prompt_checkpoint>(
+                                   std::prev(prompt.checkpoints.end(), (std::ptrdiff_t) n_keep), prompt.checkpoints.end()),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
