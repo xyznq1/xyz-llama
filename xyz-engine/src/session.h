@@ -26,6 +26,9 @@ struct SessionStart {
     int      accept_mode = xe::ACC_BLOCK;   // ACC_PLAIN: the request carries a grammar (the server's plain coupled verify)
     // At the budget end, each round drafts min(n_draws, remaining - 1); with one token left, control returns to the server.
     bool     budget_tail = false;
+    // A waiting lazy grammar (xe_start.cut): block verification reads each draft only up to its first id here (<= 16).
+    const int32_t * cut = nullptr;
+    int      n_cut = 0;
     // the drafter's cell table is the Drafter's ring (Drafter::ring_load: the server's table at the takeover)
 };
 
@@ -49,6 +52,8 @@ struct Session {
     uint32_t * d_exc = nullptr;
     int n_exc = 0;
     xe::Mt19937 * d_rng = nullptr;
+    // [0]: the waiting grammar's trigger count (0: no cut), [1..16]: its ids; written by run(), read by the accept kernel
+    int32_t * d_cut = nullptr;
     int32_t * d_tid = nullptr, * d_nok = nullptr, * d_did = nullptr, * d_draft = nullptr;
     float * d_tval = nullptr, * d_dval = nullptr, * d_seed_g = nullptr;
     uint64_t * d_tks = nullptr;

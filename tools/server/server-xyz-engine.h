@@ -61,6 +61,8 @@ struct xe_start {
     int32_t  n_skip;
     int32_t  budget_tail;
     int32_t  chain_steps;
+    const int32_t * cut;    // a waiting lazy grammar's trigger ids: block verification cuts each draft before the first
+    int32_t  n_cut;         // (<= 16; 0: no cut)
 };
 
 #define XE_RF_TIE   1u

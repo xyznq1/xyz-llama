@@ -168,6 +168,16 @@ bool common_sampler_engine_ok(const struct common_sampler * gsmpl, const struct 
 int  common_sampler_engine_budget(const struct common_sampler * gsmpl, int32_t * remaining, int32_t * budget);
 // whether common_sampler_sample keeps `id` drawn unconstrained: false only when the grammar applies and rejects it
 bool common_sampler_engine_grammar_ok(struct common_sampler * gsmpl, llama_token id);
+// a grammar constrains the next token now (a non-lazy grammar, or a lazy one that has triggered)
+bool common_sampler_engine_grammar_active(const struct common_sampler * gsmpl);
+// A lazy grammar still waiting for its trigger, whose triggers are all single tokens (a tool-call grammar on
+// "<tool_call>"). Until the sampler accepts one of those ids the grammar filters nothing, so rejection and block
+// verification are exact on a draft cut before its first cut id. The cut ids go to trig: the triggers, plus the last
+// token of any reasoning end sequence holding one. False when there is no grammar, it is not lazy, it has triggered, a
+// trigger is a word or a pattern, or the reasoning budget's forced sequence holds a trigger id.
+bool common_sampler_lazy_idle(const struct common_sampler * gsmpl, std::vector<llama_token> & trig);
+// the draft length verification may use: the index of the first trigger id in draft, or its size
+size_t common_draft_cut_at_trigger(const llama_tokens & draft, const std::vector<llama_token> & trig);
 // n draws of the chain's dist rng (verify rows the engine decided with one candidate)
 void common_sampler_engine_dist_skip(struct common_sampler * gsmpl, int32_t n);
 // the rest of a plain coupled verify from draft position k (common_sampler_sample_and_accept_n from i = k) on the

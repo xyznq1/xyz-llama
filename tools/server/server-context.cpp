@@ -3396,6 +3396,7 @@ private:
         server_slot *         slot;
         int                   mode;        // 0 block verification, 1 plain coupled
         bool                  grammar;     // the sampler has a grammar (its full-candidate path)
+        bool                  lazy_cut = false;   // block verification of a waiting lazy grammar (xe_start.cut)
         uint32_t              cseed;
         int32_t               p0;          // this round's verify position (id_last's)
         llama_token           id_last;
@@ -3495,6 +3496,12 @@ private:
         if (c.stopped) {
             return 0;
         }
+        // a waiting tool grammar that has triggered (under the cut its trigger id can only end a round): from here the
+        // grammar's own verification applies, so control returns to the server
+        if (c.lazy_cut && common_sampler_engine_grammar_active(slot.smpl.get())) {
+            c.why_back = "the tool-call grammar triggered";
+            return 0;
+        }
         return self.engine_round_ok(slot, &c.why_back) ? 1 : 0;
     }
 
@@ -3515,8 +3522,14 @@ private:
         const auto & samp  = slot.task->params.sampling;
         const auto & sd    = params_base.speculative.draft;
         const bool adaptive_p = std::find(samp.samplers.begin(), samp.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) != samp.samplers.end();
+        // a lazy grammar still waiting for a token trigger (a request with tools) runs block verification with the
+        // draft cut before its first trigger id, as the server's own verification does (common_sampler_lazy_idle)
+        std::vector<llama_token> lazy_trig;
+        const bool lazy_idle = !samp.grammar.empty() && common_sampler_lazy_idle(slot.smpl.get(), lazy_trig);
         const bool use_rej = sd.rejection && common_speculative_get_synth_probs(spec.get()).empty() && samp.temp > 0.0f &&
-                             samp.mirostat == 0 && samp.grammar.empty() && !adaptive_p;
+                             samp.mirostat == 0 && (samp.grammar.empty() || lazy_idle) && !adaptive_p;
+        const bool lazy_cut = use_rej && lazy_idle;
+        if (lazy_cut && lazy_trig.size() > 16) return decline("more than 16 tool-grammar trigger ids");
         if (!sd.coupled) return decline("uncoupled drafting");
         std::vector<llama_token> skip;
         std::string why_s;
@@ -3589,6 +3602,8 @@ private:
         s.d_head      = d_head;
         s.n_draws     = std::min(4, slot.task->params.speculative.draft.n_max);   // the engine's verify holds 5 columns
         s.accept_mode = use_rej ? 0 : 1;
+        s.cut         = lazy_cut ? lazy_trig.data() : nullptr;
+        s.n_cut       = lazy_cut ? (int32_t) lazy_trig.size() : 0;
         s.skip        = skip.data();
         s.n_skip      = (int32_t) skip.size();
         // the budget end: get_n_draft_max = min(n_ctx - n_tokens - 2, n_remaining - 1 (when limited), n_max) per round,
@@ -3609,6 +3624,7 @@ private:
         c.slot    = &slot;
         c.mode    = s.accept_mode;
         c.grammar = !samp.grammar.empty();
+        c.lazy_cut = lazy_cut;
         c.cseed   = s.cseed;
         c.p0      = p0;
         c.id_last = slot.sampled;
@@ -4821,17 +4837,33 @@ private:
                 const auto & samp    = slot.task->params.sampling;
                 const bool   adaptive_p = std::find(samp.samplers.begin(), samp.samplers.end(),
                         COMMON_SAMPLER_TYPE_ADAPTIVE_P) != samp.samplers.end();
+                // a lazy grammar still waiting for a token trigger (a request with tools: the chat template's
+                // "<tool_call>" grammar) filters nothing until the sampler accepts a trigger id, so block verification is
+                // exact on the draft cut before its first trigger id (common_sampler_lazy_idle)
+                std::vector<llama_token> lazy_trig;
+                const bool   lazy_idle = !samp.grammar.empty() && common_sampler_lazy_idle(slot.smpl.get(), lazy_trig);
                 const bool   use_rej = params_base.speculative.draft.rejection && synth_probs.empty()
                         && !slot.spec_draft.empty() && dp_rej.dist.size() == slot.spec_draft.size()
                         && samp.temp > 0.0f && samp.mirostat == 0
-                        && samp.grammar.empty() && !adaptive_p;
+                        && (samp.grammar.empty() || lazy_idle) && !adaptive_p;
+                const size_t n_ver = use_rej && lazy_idle ? common_draft_cut_at_trigger(slot.spec_draft, lazy_trig)
+                                                          : slot.spec_draft.size();
+                const bool   cut   = n_ver < slot.spec_draft.size();
+                llama_tokens                               cut_draft;
+                std::vector<int32_t>                       cut_idx;
+                std::vector<std::vector<llama_token_data>> cut_dist;
+                if (cut) {
+                    cut_draft.assign(slot.spec_draft.begin(), slot.spec_draft.begin() + n_ver);
+                    cut_idx.assign(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + n_ver + 1);
+                    cut_dist.assign(dp_rej.dist.begin(), dp_rej.dist.begin() + n_ver);
+                }
                 auto accepted = !synth_probs.empty()
                     ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
                     : use_rej   // block verification: lossless, keeps the longest acceptable draft prefix
-                    ? common_sampler_sample_and_accept_n_block(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch,
-                            slot.spec_draft, dp_rej.dist, slot.spec_rej_rng, false)
+                    ? common_sampler_sample_and_accept_n_block(slot.smpl.get(), slot.ctx_tgt, cut ? cut_idx : slot.spec_i_batch,
+                            cut ? cut_draft : slot.spec_draft, cut ? cut_dist : dp_rej.dist, slot.spec_rej_rng, false)
                     : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 

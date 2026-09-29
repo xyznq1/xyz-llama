@@ -101,6 +101,11 @@ XE_API int xe_generate(xe_ctx * c, const xe_start * s, int32_t max_tokens, xe_ro
     ss.accept_mode = s->accept_mode == 1 ? xe::ACC_PLAIN : xe::ACC_BLOCK;
     ss.budget_tail = s->budget_tail != 0;   // no dist_rng: the one-token end goes back to the server
     ss.chain_steps = s->chain_steps;
+    if (s->cut != nullptr && s->n_cut > 16) {
+        fprintf(stderr, "xyz-engine: xe_generate: %d trigger ids (16 at most) -- refused\n", s->n_cut);
+        return 1;
+    }
+    ss.cut = s->cut; ss.n_cut = s->cut != nullptr ? s->n_cut : 0;
     c->ses->set_topk_skip(s->skip, s->n_skip);
     static_assert(XE_SEED_MAX == Drafter::MAXR, "the seed rows the API carries are the rows the drafter holds");
     for (int k = 0; k < s->m && k < XE_SEED_MAX; ++k) ss.seed_tok[k] = s->seed_tok[k];

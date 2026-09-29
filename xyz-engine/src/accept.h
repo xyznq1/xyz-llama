@@ -30,6 +30,9 @@ struct AcceptParams {
     // (common_sampler_sample_and_accept_n: row j's token is the coupled draw keyed coupled_key(cseed, 0, p0 + 1 + j),
     // accepted while it equals draft j) -- what a request with a (tool-call) grammar runs
     int   mode;
+    // A waiting lazy grammar (xe_start.cut), device memory: [0] = n (<= 16), [1..n] = its trigger ids. Block verification
+    // reads only the draft before the first of them; nullptr or n 0: the whole draft.
+    const int32_t * cut;
 };
 
 constexpr int ACC_BLOCK = 0;

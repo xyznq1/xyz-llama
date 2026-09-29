@@ -47,6 +47,8 @@ bool Session::init(const char * expf_path) {
     CK(cudaMalloc(&d_exc, ex.size()*4));
     CK(cudaMemcpy(d_exc, ex.data(), ex.size()*4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_rng, sizeof(xe::Mt19937)));
+    CK(cudaMalloc(&d_cut, 17*sizeof(int32_t)));
+    CK(cudaMemset(d_cut, 0, 17*sizeof(int32_t)));
     CK(cudaMalloc(&d_tid, 8*K*4)); CK(cudaMalloc(&d_tval, 8*K*4)); CK(cudaMalloc(&d_nok, 64));
     CK(cudaMalloc(&d_did, 8*K*4)); CK(cudaMalloc(&d_dval, 8*K*4)); CK(cudaMalloc(&d_draft, 64));
     CK(cudaMalloc(&d_tks, xe::topk_rows_scratch(e.m.hp.n_vocab, e.T)));
@@ -77,11 +79,23 @@ void Session::logits_row(int r, float * dst) {
     CK(cudaMemcpy(dst, e.logits + (size_t) r*e.m.hp.n_vocab, (size_t) e.m.hp.n_vocab*sizeof(float), cudaMemcpyDeviceToHost));
 }
 
+// the draft length block verification reads (the accept kernel): the index of the first trigger id, else G
+static int cut_len(const SessionStart & s, const int32_t * drafts, const int G) {
+    for (int j = 0; j < G; ++j) {
+        for (int e = 0; e < s.n_cut && e < 16; ++e) {
+            if (drafts[j] == s.cut[e]) {
+                return j;
+            }
+        }
+    }
+    return G;
+}
+
 void Session::issue_accept(const int G, const int mode) {
     cudaStream_t st = e.st;
     xe::topk_rows(st, e.logits, e.m.hp.n_vocab, G + 1, K, topk_skip, n_topk_skip, d_tid, d_tval, d_nok, d_tks);
     k_rec_to_accept_s<<<G, 32, 0, st>>>(dr.rec, G, K, d_did, d_dval, d_draft);
-    const xe::AcceptParams prm = { G, K, 0.95f, 0.95f, 0, 0, mode };
+    const xe::AcceptParams prm = { G, K, 0.95f, 0.95f, 0, 0, mode, d_cut };
     xe::accept(st, prm, d_tid, d_tval, d_did, d_dval, d_draft, d_rng, d_exc, n_exc, d_out, dr.keys);
     // the next seed's g rows: the verify's fold rows 0..G (the host path keeps them there too)
     CK(cudaMemcpyAsync(d_seed_g, e.g_rows, (size_t) (G + 1)*5120*sizeof(float), cudaMemcpyDeviceToDevice, st));
@@ -95,6 +109,12 @@ bool Session::run(const SessionStart & s, int max_tokens, const RoundFn & on_rou
         return false;
     }
     CK(cudaMemcpyAsync(d_rng, &s.rng, sizeof(s.rng), cudaMemcpyHostToDevice, st));
+    {   // the waiting grammar's trigger ids: block verification reads each draft only up to the first
+        int32_t hc[17] = {};
+        hc[0] = s.accept_mode == xe::ACC_BLOCK && s.cut != nullptr ? std::min(s.n_cut, 16) : 0;
+        for (int k = 0; k < hc[0]; ++k) hc[1 + k] = s.cut[k];
+        CK(cudaMemcpyAsync(d_cut, hc, sizeof(hc), cudaMemcpyHostToDevice, st));   // pageable: staged before return
+    }
     CK(cudaMemcpyAsync(d_seed_g, s.seed_g, (size_t) s.m*5120*sizeof(float), cudaMemcpyHostToDevice, st));
     int     m = s.m;
     int32_t seed_pos0 = s.seed_pos0, p0 = s.p0, id_last = s.id_last, pending = s.pending;
@@ -136,7 +156,7 @@ bool Session::run(const SessionStart & s, int max_tokens, const RoundFn & on_rou
         for (int k = 0; k < n; ++k) toks[k] = h_out->tokens[k];
         out.rounds++;
         if (!plain) {
-            out.rng_draws += 2ull*(uint64_t) (G + 1);   // G + 1 uniforms, two engine outputs each
+            out.rng_draws += 2ull*(uint64_t) (cut_len(s, h_draft, G) + 1);   // Gv + 1 uniforms, two engine outputs each
         }
         uint32_t flags = 0;
         for (int r = 0; r < G + 1; ++r) {

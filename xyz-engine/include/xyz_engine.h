@@ -75,6 +75,11 @@ struct xe_start {
     int32_t  budget_tail;
     // Drafter chain length; 0 means n_draws. The pruned final-step FFN runs only at the last chain step.
     int32_t  chain_steps;
+    // A lazy grammar still waiting for a token trigger (common_sampler_lazy_idle): with accept_mode 0, block verification
+    // reads each draft only up to its first id in cut[0, n_cut), as the server's verification does, so a trigger id
+    // can only be a round's last token. n_cut 0: no cut.
+    const int32_t * cut;
+    int32_t  n_cut;
 };
 
 // One round: toks[0..*n) contains accepted drafts followed by the new token; one_mask bit j marks a plain-verification

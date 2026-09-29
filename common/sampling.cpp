@@ -6,6 +6,7 @@
 #include "reasoning-budget.h"
 
 #include "ggml.h"
+#include "../src/llama-ext.h"   // llama_sampler_grammar_awaiting
 
 #include <algorithm>
 #include <cctype>
@@ -1559,6 +1560,62 @@ int common_sampler_engine_budget(const struct common_sampler * gsmpl, int32_t * 
     }
     *remaining = common_reasoning_budget_get_remaining(gsmpl->rbudget, budget);
     return (int) common_reasoning_budget_get_state(gsmpl->rbudget);
+}
+
+bool common_sampler_engine_grammar_active(const struct common_sampler * gsmpl) {
+    if (gsmpl == nullptr || gsmpl->grmr == nullptr) {
+        return false;
+    }
+    return !gsmpl->params.grammar_lazy || !llama_sampler_grammar_awaiting(gsmpl->grmr);
+}
+
+// While a lazy grammar waits, llama_grammar_apply_impl returns at once and llama_grammar_accept_impl only looks for a
+// trigger (src/llama-grammar.cpp): with token triggers alone it switches on exactly when the sampler accepts one.
+bool common_sampler_lazy_idle(const struct common_sampler * gsmpl, std::vector<llama_token> & trig) {
+    trig.clear();
+    if (gsmpl == nullptr || gsmpl->grmr == nullptr || !gsmpl->params.grammar_lazy ||
+            !llama_sampler_grammar_awaiting(gsmpl->grmr)) {
+        return false;
+    }
+    for (const auto & t : gsmpl->params.grammar_triggers) {
+        if (t.type != COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) {
+            trig.clear();
+            return false;
+        }
+        trig.push_back(t.token);
+    }
+    const std::vector<llama_token> base = trig;
+    const auto has_trig = [&](const llama_tokens & seq) {
+        for (const llama_token id : seq) {
+            if (std::find(base.begin(), base.end(), id) != base.end()) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // the forced sequence runs only when a budget expires: decline if it could trigger
+    if (trig.empty() || has_trig(gsmpl->params.reasoning_budget_forced)) {
+        trig.clear();
+        return false;
+    }
+    // a reasoning end sequence is replayed into the grammar once it completes (common_sampler_accept): one that holds
+    // a trigger id switches the grammar on when its LAST token is accepted, so that token cuts too (a thinking chat
+    // template lists "<tool_call>" itself as an end tag: the same id, nothing added)
+    for (const auto & seq : gsmpl->params.reasoning_budget_end) {
+        if (!seq.empty() && has_trig(seq) && std::find(trig.begin(), trig.end(), seq.back()) == trig.end()) {
+            trig.push_back(seq.back());
+        }
+    }
+    return true;
+}
+
+size_t common_draft_cut_at_trigger(const llama_tokens & draft, const std::vector<llama_token> & trig) {
+    for (size_t j = 0; j < draft.size(); ++j) {
+        if (std::find(trig.begin(), trig.end(), draft[j]) != trig.end()) {
+            return j;
+        }
+    }
+    return draft.size();
 }
 
 bool common_sampler_engine_grammar_ok(struct common_sampler * gsmpl, llama_token id) {

@@ -200,12 +200,25 @@ static __global__ void k_accept(const AcceptParams prm, const int32_t * __restri
     if (threadIdx.x != 0 || blockIdx.x != 0) {
         return;
     }
+    // the draft block verification reads: up to its first waiting-grammar trigger id (plain verification never cuts)
+    int Gv = G;
+    if (!plain && prm.cut != nullptr) {
+        const int nc = min(prm.cut[0], 16);
+        for (int j = 0; j < G && Gv == G; ++j) {
+            for (int e = 0; e < nc; ++e) {
+                if (draft[j] == prm.cut[1 + e]) {
+                    Gv = j;
+                    break;
+                }
+            }
+        }
+    }
     out->one_mask = 0;
     // the server's host re-check of the device draft chain (common/speculative.cpp draft_device_chain): each draw's chain
     // re-run on its record with the host's math -- the draft ends at the first draw it does not reproduce
     out->cut = -1;
     if (keys2 != nullptr) {
-        for (int j = 0; j < G && out->cut < 0; ++j) {
+        for (int j = 0; j < Gv && out->cut < 0; ++j) {   // a draw past the verified draft cannot change the round
             const int nq = n_d[j];
             int sel = 0;
             if (nq > 1) {
@@ -256,13 +269,14 @@ static __global__ void k_accept(const AcceptParams prm, const int32_t * __restri
     const auto P = [&](int j, int32_t t) { return prob_of(out->p_id[j], out->p_p[j], out->p_n[j], t); };
     const auto Q = [&](int j, int32_t t) { return prob_of(out->q_id[j], out->q_p[j], out->q_n[j], t); };
 
+    // over the verified draft d_0..d_{Gv-1}: Gv + 1 uniforms
     double w[ACC_MAX_G + 1], h[ACC_MAX_G + 1];
     w[0] = 1.0;
-    for (int j = 0; j < G; ++j) {
+    for (int j = 0; j < Gv; ++j) {
         const double q = Q(j, draft[j]);
         w[j + 1] = q > 0.0 ? fmin(w[j] * P(j, draft[j]) / q, 1.0) : 0.0;
     }
-    for (int j = 0; j < G; ++j) {
+    for (int j = 0; j < Gv; ++j) {
         double S = 0.0;
         for (int i = 0; i < out->p_n[j]; ++i) {
             const double r = w[j] * (double) out->p_p[j][i] - Q(j, out->p_id[j][i]);
@@ -273,23 +287,23 @@ static __global__ void k_accept(const AcceptParams prm, const int32_t * __restri
         const double den = S + 1.0 - w[j];
         h[j] = den > 1e-15 ? S / den : 1.0;
     }
-    h[G] = w[G];
+    h[Gv] = w[Gv];
 
     int tau = 0;
-    for (int j = 1; j <= G; ++j) {
+    for (int j = 1; j <= Gv; ++j) {
         const double u = uni01(*rng);
         if (u <= h[j]) {
             tau = j;
         }
     }
 
-    // the token after the accepted prefix: the residual w p - q of row tau (row G: p itself), else p
+    // the token after the accepted prefix: the residual w p - q of row tau (row Gv: p itself), else p
     int32_t res_id[ACC_MAX_TK];
     double  res_r[ACC_MAX_TK];
     int     n_res = 0;
     double  z = 0.0;
     for (int i = 0; i < out->p_n[tau]; ++i) {
-        const double r = tau == G ? (double) out->p_p[tau][i] : w[tau] * (double) out->p_p[tau][i] - Q(tau, out->p_id[tau][i]);
+        const double r = tau == Gv ? (double) out->p_p[tau][i] : w[tau] * (double) out->p_p[tau][i] - Q(tau, out->p_id[tau][i]);
         if (r > 0.0) {
             res_id[n_res] = out->p_id[tau][i];
             res_r[n_res]  = r;
