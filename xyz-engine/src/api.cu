@@ -108,6 +108,8 @@ XE_API int xe_generate(xe_ctx * c, const xe_start * s, int32_t max_tokens, xe_ro
         return 1;
     }
     ss.cut = s->cut; ss.n_cut = s->cut != nullptr ? s->n_cut : 0;
+    ss.min_p_on    = s->min_p_on != 0;
+    ss.min_p_log   = s->min_p_log;
     c->ses->set_topk_skip(s->skip, s->n_skip);
     static_assert(XE_SEED_MAX == Drafter::MAXR, "the seed rows the API carries are the rows the drafter holds");
     for (int k = 0; k < s->m && k < XE_SEED_MAX; ++k) ss.seed_tok[k] = s->seed_tok[k];

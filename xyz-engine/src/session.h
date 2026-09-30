@@ -29,6 +29,9 @@ struct SessionStart {
     // A waiting lazy grammar (xe_start.cut): block verification reads each draft only up to its first id here (<= 16).
     const int32_t * cut = nullptr;
     int      n_cut = 0;
+    // the target's min-p cut after top_p (xe_start min_p_on / min_p_log)
+    bool     min_p_on  = false;
+    float    min_p_log = 0.0f;
     // the drafter's cell table is the Drafter's ring (Drafter::ring_load: the server's table at the takeover)
 };
 
@@ -79,7 +82,7 @@ struct Session {
     using RoundFn = std::function<bool(int32_t * toks, int & n, uint32_t one_mask, const int32_t * drafts, uint32_t flags)>;
     int round_g = 0;   // the round's draft count (drafts[0..round_g)), valid inside on_round
     // One round's accept launches: top-k, draft records, acceptance, and the next seed's fold rows.
-    void issue_accept(int G, int mode);
+    void issue_accept(int G, const SessionStart & s);
     // rounds until max_tokens are handed over or on_round returns false; the stream is e.st
     bool run(const SessionStart & s, int max_tokens, const RoundFn & on_round, SessionEnd & out);
     // row r of the last verify's logits (n_vocab floats) to the host -- valid until the next round

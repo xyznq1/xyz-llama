@@ -91,11 +91,11 @@ static int cut_len(const SessionStart & s, const int32_t * drafts, const int G) 
     return G;
 }
 
-void Session::issue_accept(const int G, const int mode) {
+void Session::issue_accept(const int G, const SessionStart & s) {
     cudaStream_t st = e.st;
     xe::topk_rows(st, e.logits, e.m.hp.n_vocab, G + 1, K, topk_skip, n_topk_skip, d_tid, d_tval, d_nok, d_tks);
     k_rec_to_accept_s<<<G, 32, 0, st>>>(dr.rec, G, K, d_did, d_dval, d_draft);
-    const xe::AcceptParams prm = { G, K, 0.95f, 0.95f, 0, 0, mode, d_cut };
+    const xe::AcceptParams prm = { G, K, 0.95f, 0.95f, 0, 0, s.accept_mode, d_cut, s.min_p_on ? 1 : 0, s.min_p_log };
     xe::accept(st, prm, d_tid, d_tval, d_did, d_dval, d_draft, d_rng, d_exc, n_exc, d_out, dr.keys);
     // the next seed's g rows: the verify's fold rows 0..G (the host path keeps them there too)
     CK(cudaMemcpyAsync(d_seed_g, e.g_rows, (size_t) (G + 1)*5120*sizeof(float), cudaMemcpyDeviceToDevice, st));
@@ -146,7 +146,7 @@ bool Session::run(const SessionStart & s, int max_tokens, const RoundFn & on_rou
         e.n_past = p0;
         e.dev_draft_n = G;
         e.pass(vt.data(), pending, G + 1);
-        issue_accept(G, s.accept_mode);
+        issue_accept(G, s);
         CK(cudaMemcpyAsync(h_out, d_out, offsetof(xe::AcceptOut, p_n), cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(&h_out->one_mask, &d_out->one_mask, 2*sizeof(int32_t), cudaMemcpyDeviceToHost, st));   // + cut
         CK(cudaMemcpyAsync(h_nok, d_nok, (size_t) (G + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, st));

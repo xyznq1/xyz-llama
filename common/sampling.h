@@ -159,11 +159,12 @@ typedef std::unique_ptr<common_sampler, common_sampler_deleter> common_sampler_p
 
 // ---- xyz-engine: the server hands a response's speculative rounds to an external engine
 // (xyz_engine.dll) and walks each round's tokens through the slot's sampler afterwards
-// whether the target's chain is the one the engine reproduces: top_k 20 ahead of top_p 0.95, then dist; every other
-// sampler neutral (temperature 1, min_p 0, no penalties / dry / xtc / typical / top-n-sigma / mirostat / adaptive-p),
-// logit biases only -inf -- their ids (and the vocabulary's suppress tokens) in skip; why: the first reason it is not
+// whether the target's chain is the one the engine reproduces: top_k 20 ahead of top_p 0.95, then (min_p > 0) the min-p
+// cut, then dist; every other sampler neutral (temperature 1, no penalties / dry / xtc / typical / top-n-sigma /
+// mirostat / adaptive-p), logit biases only -inf -- their ids (and the vocabulary's suppress tokens) in skip; min_p: the
+// chain's min-p (0: none in the chain); why: the first reason it is not
 bool common_sampler_engine_ok(const struct common_sampler * gsmpl, const struct llama_vocab * vocab, std::vector<llama_token> & skip,
-                              std::string & why);
+                              float & min_p, std::string & why);
 // the reasoning budget: its state (common_reasoning_budget_state, -1 without one), the tokens left and the block's budget
 int  common_sampler_engine_budget(const struct common_sampler * gsmpl, int32_t * remaining, int32_t * budget);
 // whether common_sampler_sample keeps `id` drawn unconstrained: false only when the grammar applies and rejects it

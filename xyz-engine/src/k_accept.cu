@@ -158,7 +158,20 @@ static __global__ void k_accept(const AcceptParams prm, const int32_t * __restri
             const int  j  = tr ? r : r - G - 1;
             const float * ex = tr ? ex_t[j] : ex_d[j];
             float pb[ACC_MAX_TK];
-            const int n = top_p_cut(ex, tk, tr ? prm.top_p_t : prm.top_p_d, tr ? prm.min_keep_t : prm.min_keep_d, pb);
+            int n = top_p_cut(ex, tk, tr ? prm.top_p_t : prm.top_p_d, tr ? prm.min_keep_t : prm.min_keep_d, pb);
+            if (tr && prm.min_p_t) {
+                // llama_sampler_min_p_apply on the sorted candidates (min_keep 0): the first always stays, then the
+                // prefix while logit >= logit_0 + logf(p) (one float add, as the host's)
+                const float * lg = t_logit + j*tk;
+                const float min_logit = lg[0] + prm.min_p_log_t;
+                int i = 1;
+                for (; i < n; ++i) {
+                    if (lg[i] < min_logit) {
+                        break;
+                    }
+                }
+                n = i;
+            }
             double s = 0.0;
             if (n != 1) {
                 for (int i = 0; i < n; ++i) {

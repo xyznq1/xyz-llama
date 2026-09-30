@@ -80,6 +80,10 @@ struct xe_start {
     // can only be a round's last token. n_cut 0: no cut.
     const int32_t * cut;
     int32_t  n_cut;
+    // 1: the target's chain cuts by min-p after top_p (llama_sampler_min_p_apply on sorted candidates: the prefix with
+    // logit >= top logit + min_p_log, min_p_log = the host's logf(min_p)); 0: no min-p sampler in the chain
+    int32_t  min_p_on;
+    float    min_p_log;
 };
 
 // One round: toks[0..*n) contains accepted drafts followed by the new token; one_mask bit j marks a plain-verification

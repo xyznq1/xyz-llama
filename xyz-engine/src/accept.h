@@ -1,6 +1,6 @@
 #pragma once
 // xyz-engine accept step on the device: the server's host path -- the target's top-k scan, its sampler chain
-// (top_k 20 -> top_p -> dist, llama-sampler.cpp) and block verification of a draft
+// (top_k 20 -> top_p [-> min_p] -> dist, llama-sampler.cpp) and block verification of a draft
 // (common_sampler_sample_and_accept_n_block, common/sampling.cpp) with the slot's std::mt19937 -- bit for bit: MSVC's
 // expf via an exception table (tools/expf_table.cu), float/double IEEE arithmetic in the host's order, no FMA, MSVC
 // 14.44's generate_canonical. Compiled without fast math (CMake target xe_exact).
@@ -33,6 +33,10 @@ struct AcceptParams {
     // A waiting lazy grammar (xe_start.cut), device memory: [0] = n (<= 16), [1..n] = its trigger ids. Block verification
     // reads only the draft before the first of them; nullptr or n 0: the whole draft.
     const int32_t * cut;
+    // the target's min-p cut after top_p (llama_sampler_min_p_apply on sorted candidates, min_keep 0): the prefix whose
+    // logits are >= logit_0 + min_p_log_t (the host's logf(min_p)); min_p_t 0: no min-p sampler in the chain
+    int   min_p_t;
+    float min_p_log_t;
 };
 
 constexpr int ACC_BLOCK = 0;
@@ -41,14 +45,14 @@ constexpr int ACC_PLAIN = 1;
 struct AcceptOut {
     int32_t n;                          // accepted tokens incl. the last (tau + 1)
     int32_t tokens[ACC_MAX_G + 1];
-    // Target and drafter distributions after top_p, retained in host order for acceptance.
+    // Target (after top_p and the min-p cut) and drafter (after top_p) distributions, in host order for acceptance.
     int32_t p_n[ACC_MAX_G + 1];
     int32_t p_id[ACC_MAX_G + 1][ACC_MAX_TK];
     float   p_p[ACC_MAX_G + 1][ACC_MAX_TK];
     int32_t q_n[ACC_MAX_G];
     int32_t q_id[ACC_MAX_G][ACC_MAX_TK];
     float   q_p[ACC_MAX_G][ACC_MAX_TK];
-    // plain mode: bit j set when row j's candidates after top_p were ONE (the host's dist then draws once from its
+    // plain mode: bit j set when row j's candidates after top_p (and min-p) were ONE (the host's dist then draws once from its
     // own std::mt19937 anyway -- llama_sampler_dist_apply's size-1 branch; the host discards as many)
     int32_t one_mask;
     // the first draw the server's host re-check would NOT reproduce (its own top_p cut over the draw's record, the same

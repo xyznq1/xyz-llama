@@ -930,6 +930,7 @@ private:
 
     // xyz-engine (XYZ_ENGINE=1, see engine_takeover)
     xyz_engine_dll    xe;
+    int               xe_declined_task = -1;   // the last task whose decline was logged
     xe_ctx *             xe_c      = nullptr;
     int32_t              xe_rs_row = -1;
     std::string          xe_expf;
@@ -3514,9 +3515,16 @@ private:
             return false;
         }
         const char * why = nullptr;
-        const auto decline = [](const char * /*reason*/) { return false; };
+        // a request's first decline is logged (a declined request comes back here at every round boundary)
+        const auto decline = [&](const char * reason) {
+            if (xe_declined_task != slot.task->id) {
+                xe_declined_task = slot.task->id;
+                SLT_INF(slot, "xyz-engine: declined -- %s\n", reason);
+            }
+            return false;
+        };
         if (!engine_round_ok(slot, &why)) {
-            return decline(why);
+            return false;   // a round boundary the engine cannot start from (not a property of the request)
         }
         // the verify the server would run (see the accept step): block verification or the plain coupled one
         const auto & samp  = slot.task->params.sampling;
@@ -3533,8 +3541,9 @@ private:
         if (!sd.coupled) return decline("uncoupled drafting");
         std::vector<llama_token> skip;
         std::string why_s;
-        if (!common_sampler_engine_ok(slot.smpl.get(), vocab, skip, why_s)) {
-            return false;
+        float min_p = 0.0f;
+        if (!common_sampler_engine_ok(slot.smpl.get(), vocab, skip, min_p, why_s)) {
+            return decline(why_s.c_str());
         }
         // the drafter's next seed decode: its catch-up rows and the deferred boundary row, right before id_last
         common_speculative_engine_rows rows;
@@ -3611,6 +3620,9 @@ private:
         // min(n_draws, max_tokens - handed - 1) with max_tokens = min(n_ctx - p0 - 1, n_remaining)
         s.budget_tail = 1;
         s.chain_steps = sd.n_max;   // llama_draft_chain_init's n_steps (common_speculative params.n_max)
+        // the target's min-p cut: the offset llama_sampler_min_p_apply adds to the top logit (the same logf of the same float)
+        s.min_p_on    = min_p > 0.0f ? 1 : 0;
+        s.min_p_log   = min_p > 0.0f ? logf(min_p) : 0.0f;
         int32_t max_tokens = slot.n_ctx - p0 - 1;
         if (slot.n_remaining() > 0) {
             max_tokens = std::min(max_tokens, (int32_t) slot.n_remaining());
@@ -3632,6 +3644,9 @@ private:
         llama_synchronize(ctx_tgt);   // the server's last decodes are done with the buffers the engine now writes
         llama_synchronize(ctx_dft);
         const int rc = xe.generate(xe_c, &s, max_tokens, &engine_round, &c, &e);
+        SLT_INF(slot, "xyz-engine: %d rounds, %d tokens (from %d, %s verify%s)%s\n", e.rounds, e.n_tokens, p0,
+                s.accept_mode == 0 ? "block" : "plain", s.min_p_on ? ", min-p" : "",
+                c.stopped ? ", stopped" : (c.why_back != nullptr ? ", handed back" : ""));
         if (rc != 0 || e.rounds == 0) {
             // nothing ran (the engine refused its inputs): the server's state is untouched
             SLT_WRN(slot, "xyz-engine: xe_generate returned %d after %d rounds\n", rc, e.rounds);

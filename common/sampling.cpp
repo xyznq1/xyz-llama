@@ -1505,17 +1505,17 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
 // through this sampler afterwards; see sampling.h.
 
 bool common_sampler_engine_ok(const struct common_sampler * gsmpl, const struct llama_vocab * vocab, std::vector<llama_token> & skip,
-                              std::string & why) {
+                              float & min_p, std::string & why) {
     const auto & p = gsmpl->params;
     const auto no = [&](const char * r) {
         why = r;
         return false;
     };
+    min_p = 0.0f;
     if (p.mirostat != 0) return no("mirostat");
     if (p.top_k != 20) return no("top_k != 20");
     if (p.top_p != 0.95f) return no("top_p != 0.95");
     if (p.min_keep != 0) return no("min_keep");
-    if (p.min_p > 0.0f) return no("min_p");
     if (p.temp != 1.0f) return no("temperature != 1");
     if (p.dynatemp_range > 0.0f) return no("dynatemp");
     if (p.typ_p < 1.0f) return no("typical_p");
@@ -1525,18 +1525,28 @@ bool common_sampler_engine_ok(const struct common_sampler * gsmpl, const struct 
         return no("penalties");
     }
     if (!(p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n == 0)) return no("dry");
-    // the engine keeps the top 20, then the nucleus of those: top_k ahead of top_p, and the chain ends in dist
-    bool seen_k = false, seen_p = false;
+    // the engine keeps the top 20, then the nucleus of those, then (min_p > 0) the min-p prefix of those: top_k ahead of
+    // top_p ahead of min_p, and the chain ends in dist
+    bool seen_k = false, seen_p = false, seen_m = false;
     for (const auto & s : p.samplers) {
         if (s == COMMON_SAMPLER_TYPE_TOP_K) seen_k = true;
         if (s == COMMON_SAMPLER_TYPE_TOP_P) {
             if (!seen_k) return no("top_p ahead of top_k");
+            if (seen_m && p.min_p > 0.0f) return no("min_p ahead of top_p");
             seen_p = true;
+        }
+        if (s == COMMON_SAMPLER_TYPE_MIN_P && p.min_p > 0.0f) {
+            if (seen_m) return no("min_p twice in the chain");
+            if (!seen_k) return no("min_p ahead of top_k");
+            seen_m = true;
         }
         if (s == COMMON_SAMPLER_TYPE_ADAPTIVE_P) return no("adaptive_p");
         if (s == COMMON_SAMPLER_TYPE_INFILL) return no("infill");
     }
     if (!seen_k || !seen_p) return no("no top_k / top_p in the chain");
+    if (seen_m) {
+        min_p = p.min_p;
+    }
     // logit biases: only -inf (the top-k never admits those ids), plus the vocabulary's suppress tokens
     skip.clear();
     for (const auto & lb : p.logit_bias) {
