@@ -156,6 +156,15 @@ void flash_attn_q4_0_prompt(cudaStream_t st, const float * q, int n_tokens, int 
 void flash_attn_q4_0(cudaStream_t st, const float * q, int n_tokens, int n_head, const void * k_cache, const void * v_cache,
                      int n_kv, int kv_size, const half * mask, float scale, float * dst);
 
+// ---- k_fa_vec.cu: one row before Ada, the fork's vector kernel through its own launcher -------------------------------
+// true where the server's attention of n_tokens rows over n_kv quantized cells is the vector kernel (cc < 890, one row,
+// n_kv a multiple of 256): flash_attn / flash_attn_q4_0 then take it, and the f16 mask must hold all n_kv cells
+bool fa_vec_rule(int n_tokens, int n_kv);
+void flash_attn_vec(cudaStream_t st, const float * q, int n_head, const void * k_cache, const void * v_cache, int n_kv,
+                    int kv_size, const half * mask, float scale, float * dst);
+void flash_attn_vec_q4_0(cudaStream_t st, const float * q, int n_head, const void * k_cache, const void * v_cache, int n_kv,
+                         int kv_size, const half * mask, float scale, float * dst);
+
 // ---- drafter kernels (k_mmvq.cu, k_rope.cu, k_fwht.cu, k_setrows.cu, k_unary.cu) --------------------------------------
 // one column of a quantized weight (Q3_K), the activation quantized to q8_1 into q8; gate + glu_op = the fused GLU (w =
 // the UP weight), x_bias = the fused residual add

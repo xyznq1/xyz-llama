@@ -99,6 +99,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {}
 void ggml_cuda_flash_attn_ext_compact_mask(const ggml_tensor *, int32_t *, int32_t, cudaStream_t) {
     not_wired("ggml_cuda_flash_attn_ext_compact_mask");
 }
+to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type) {
+    not_wired("ggml_get_to_fp16_cuda");
+}
+to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type) {
+    not_wired("ggml_get_to_fp16_nc_cuda");
+}
 
 namespace eng {
 ggml_backend_cuda_context * g_ctx = nullptr;   // used by k_fattn.cu

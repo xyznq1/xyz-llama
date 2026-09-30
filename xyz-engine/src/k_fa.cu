@@ -233,7 +233,9 @@ void flash_attn(cudaStream_t st, const float * q, int n_tokens, int n_head, cons
                 int n_kv, int kv_size, const half * mask, float scale, float * dst, const int * vis_pos) {
     constexpr ggml_type T2 = GGML_TYPE_XYZKV2_0;
     const int d32 = pair_d(4, n_head / N_HEAD_KV, n_tokens);
-    if (n_tokens <= 1) {
+    if (fa_vec_rule(n_tokens, n_kv)) {
+        flash_attn_vec(st, q, n_head, k_cache, v_cache, n_kv, kv_size, mask, scale, dst);
+    } else if (n_tokens <= 1) {
         launch<1, T2>(st, q, n_tokens, n_head, k_cache, v_cache, n_kv, kv_size, mask, scale, dst, vis_pos);
     } else if (n_tokens <= 2) {
         launch<2, T2>(st, q, n_tokens, n_head, k_cache, v_cache, n_kv, kv_size, mask, scale, dst, vis_pos);
@@ -260,7 +262,9 @@ void flash_attn_q4_0(cudaStream_t st, const float * q, int n_tokens, int n_head,
                      int n_kv, int kv_size, const half * mask, float scale, float * dst) {
     constexpr ggml_type Q4 = GGML_TYPE_Q4_0;
     const int d32 = pair_d(4, n_head / N_HEAD_KV, n_tokens);
-    if (n_tokens <= 2) {
+    if (fa_vec_rule(n_tokens, n_kv)) {
+        flash_attn_vec_q4_0(st, q, n_head, k_cache, v_cache, n_kv, kv_size, mask, scale, dst);
+    } else if (n_tokens <= 2) {
         launch<2, Q4>(st, q, n_tokens, n_head, k_cache, v_cache, n_kv, kv_size, mask, scale, dst);
     } else if (n_tokens <= 32/d32) {
         launch<4, Q4>(st, q, n_tokens, n_head, k_cache, v_cache, n_kv, kv_size, mask, scale, dst);

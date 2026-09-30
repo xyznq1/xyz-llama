@@ -20,7 +20,7 @@ target_compile_options(xe_exact PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>)
 # ggml-cuda's own nvcc options: the engine's kernels are bit-identical to the fork's at these flags
 set(ENGINE_SRC src/api.cu src/model.cu src/engine.cu src/fork_shims.cu src/draft.cu src/session.cu src/prefill.cu
     src/k_hadamard.cu src/k_attn_chain.cu src/k_small.cu src/k_ptq1_own.cu src/k_gdn_own.cu src/k_gdn_pro.cu src/k_q3k.cu
-    src/k_draw.cu src/k_fa.cu src/k_mmq.cu)
+    src/k_draw.cu src/k_fa.cu src/k_fa_vec.cu src/k_mmq.cu)
 add_library(xyz_engine SHARED ${ENGINE_SRC})
 target_compile_options(xyz_engine PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -extended-lambda -compress-mode=size>)
 target_include_directories(xyz_engine PRIVATE include src ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src

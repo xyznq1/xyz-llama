@@ -110,9 +110,10 @@ static __global__ void k_pf_inputs(int32_t * __restrict__ pos, int64_t * __restr
 // the f16 mask of a verify-width chunk (llama_kv_cache::build_kq_mask_dev's values: cell j visible to row r iff its position
 // < p_r + 0.5; one sequence in compact cells, so cell j holds position j and the cells past the chunk are empty) -- from
 // the last 64-aligned tile start at or below p0 + 1 only: flash_attn (vis_pos = the chunk's positions) reads none before
-static __global__ void k_pf_mask_f16(half * __restrict__ mask, const int n, const int64_t p0, const int n_kv) {
+// (full: all n_kv cells, for the vector kernel -- eng::fa_vec_rule)
+static __global__ void k_pf_mask_f16(half * __restrict__ mask, const int n, const int64_t p0, const int n_kv, const bool full) {
     const int j = blockIdx.x*blockDim.x + threadIdx.x;
-    if (j >= n_kv || j < (p0 + 1) / 64 * 64) {
+    if (j >= n_kv || (!full && j < (p0 + 1) / 64 * 64)) {
         return;
     }
     for (int r = 0; r < n; ++r) {
@@ -355,7 +356,7 @@ bool Engine::prefill_small(const int32_t * tokens, const int n, const bool want_
 
     CK(cudaMemcpyAsync(b.tok, tokens, (size_t) n*sizeof(int32_t), cudaMemcpyHostToDevice, st));
     k_pf_inputs<<<(std::max(n, n_kv) + 255)/256, 256, 0, st>>>(b.pos, b.kv_idx, b.mask_pos, n, p0, n_kv);
-    k_pf_mask_f16<<<(n_kv + 255)/256, 256, 0, st>>>(b.mask16, n, p0, n_kv);
+    k_pf_mask_f16<<<(n_kv + 255)/256, 256, 0, st>>>(b.mask16, n, p0, n_kv, eng::fa_vec_rule(n, n_kv));
     upload_pending(b, st, pending);
     if (p0 == 0) {
         for (Layer & l : L) {

@@ -46,11 +46,11 @@ static __global__ void k_add(const float * __restrict__ a, const float * __restr
 // the device KQ mask (llama_kv_cache::build_kq_mask_dev): cell j is visible to row r iff its position < pos_r + 0.5 --
 // one sequence in compact cells, so cell j holds position j and cells past the batch are empty (masked). Only from the
 // last 64-aligned tile start at or below pos_0 + 1: before it every row sees every cell, and flash_attn (vis_pos) reads
-// no mask there.
-static __global__ void k_kq_mask(half * __restrict__ mask, const PassIn * __restrict__ in, const int n_tok) {
+// no mask there -- except the vector kernel (full: eng::fa_vec_rule), which reads every cell.
+static __global__ void k_kq_mask(half * __restrict__ mask, const PassIn * __restrict__ in, const int n_tok, const bool full) {
     const int n_kv = in->n_kv;
     const int j = blockIdx.x*blockDim.x + threadIdx.x;
-    if (j >= n_kv || j < (in->pos[0] + 1) / 64 * 64) {
+    if (j >= n_kv || (!full && j < (in->pos[0] + 1) / 64 * 64)) {
         return;
     }
     for (int r = 0; r < n_tok; ++r) {
@@ -277,7 +277,7 @@ void Engine::issue(const int n_kv, const int par) {
     eng::get_rows_ptq1(st, tok_embd, 5120, hp.n_vocab, in_dev->tokens, Tw, emb, tok_ilv);
     eng::fwht_block(st, emb, xf, (int64_t) 5*Tw, nullptr, 1, nullptr);
     k_mul_signs<<<(5120*Tw + 255)/256, 256, 0, st>>>(xf, s5120, x, 5120, 5120*Tw);
-    k_kq_mask<<<(n_kv + 255)/256, 256, 0, st>>>(mask, in_dev, Tw);
+    k_kq_mask<<<(n_kv + 255)/256, 256, 0, st>>>(mask, in_dev, Tw, eng::fa_vec_rule(Tw, n_kv));
 
     for (int il = 0; il < hp.n_layer; ++il) {
         const Layer & l = L[il];
