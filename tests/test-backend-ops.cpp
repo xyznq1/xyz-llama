@@ -51,14 +51,30 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// TEST_BACKEND_SEED=<n>: every init_tensor_uniform draw is seeded from n and the ORDER of
+// the (sequential) calls -- the threaded fill derives its chunks' seeds from its call's seed and the chunk start, never
+// from thread timing -- so two processes build byte-identical inputs and TEST_BACKEND_HASH outputs compare across runs
+// (e.g. one test exe next to two ggml-cuda.dll builds). Unset: random_device, as before.
+static uint32_t test_rng_seed() {
+    static const char * env = getenv("TEST_BACKEND_SEED");
+    if (env == nullptr) {
+        return std::random_device{}();
+    }
+    static std::atomic<uint64_t> calls{0};
+    uint64_t x = strtoull(env, nullptr, 10) * 0x9E3779B97F4A7C15ull + (calls.fetch_add(1) + 1) * 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 31; x *= 0x94D049BB133111EBull; x ^= x >> 29;
+    return (uint32_t) x;
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
         // parallel initialization
         static const size_t n_threads = N_THREADS;
+        const uint32_t call_seed = test_rng_seed();
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            std::default_random_engine gen(call_seed ^ (uint32_t) (start * 2654435761u));
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -1499,6 +1515,19 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            // TEST_BACKEND_HASH=1: the tested backend's output bytes as FNV-1a 64 + the NMSE, for EVERY
+            // case. Two runs with the same TEST_BACKEND_SEED print the same hash iff they computed the same bits -- "word for
+            // word" at the op level, which an NMSE bound cannot show.
+            static const bool print_hash = getenv("TEST_BACKEND_HASH") != nullptr;
+            if (print_hash) {
+                std::vector<uint8_t> raw(ggml_nbytes(t1));
+                ggml_backend_tensor_get(t1, raw.data(), 0, raw.size());
+                uint64_t h = 1469598103934665603ULL;
+                for (const uint8_t b : raw) {
+                    h = (h ^ b) * 1099511628211ULL;
+                }
+                printf("[%s] HASH %016llx NMSE %.12g ", ggml_op_desc(t1), (unsigned long long) h, err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -10581,6 +10610,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n : {1, 5, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, n, 256, {2, 1}, {2, 1}));
     }
+    // PTQ1_0 above 32 columns runs the MMQ kernel (prefill): every n-tile width class (33 -> J 40, 64, 128, 200 -> J 104,
+    // 250 = a partial J=128 tile, 256), a row count off the 128 grid (fallback), k = 384 = an odd number of 128-blocks
+    // (the last 256-value step is half empty), and the gate/up shape at a prefill width.
+    for (int64_t m : {1000, 5120}) {
+        for (int64_t k : {384, 5120}) {
+            for (int64_t n : {33, 64, 128, 200, 250, 256}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 17408, 256, 5120, {1, 1}, {1, 1}));
     for (int64_t tokens : {1, 2, 4, 5, 8}) {
         for (int64_t rows : {32, 40, 1040}) {
             for (bool with_bias : {false, true}) {
@@ -10884,6 +10924,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
         }
+    }
+
+    // Ternary Bonsai 2 27B prefill shapes: the FFN (n_embd 5120, n_ff 17408), gate/up and down, at the default
+    // ubatch (512) and its neighbours. PTQ1_0 is not in all_types, so nothing above times its MMQ kernel.
+    for (int bs : {128, 512, 1024}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 17408, bs,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,  5120, bs, 17408, {1, 1}, {1, 1}));
     }
 
     // Qwen3.5 hybrid decode shapes and common IQ types across draft and verify widths.

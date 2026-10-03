@@ -252,27 +252,42 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
                          : (const block_ptq1_0 *) x + kbx0 + i*stride + kb;
     };
 
+    // Every lane's global load for every row is issued before any decode. With the loads inside the per-lane branches
+    // (lane < 4 / < 6 / == 6) each row paid load -> decode -> store as its own latency chain, I/(nrows*nwarps) rows x
+    // 3 paths in series per warp (SASS: 8 x (LDG STS | LDG STSx5 | LDG STSx5) per 256-value step). One aligned word per
+    // lane and row instead -- lanes 0-5 the six qs words, lanes 6-7 bytes 24-27 (qh[0], qh[1], d; block_ptq1_0 is
+    // 4-aligned) -- decoded into exactly the words the branches wrote: qs word w lands at row + w (stride 4) for w < 4
+    // and at row + 16 + w (stride 2) for w = 4, 5. Bit-identical tiles (test-backend-ops output hashes).
+    constexpr int niter = I / (nrows * nwarps);
+    static_assert(I % (nrows * nwarps) == 0, "whole rows per warp pass");
+    uint32_t packed[niter];
+
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nrows * nwarps) {
-        int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+    for (int it = 0; it < niter; ++it) {
+        int i = it * nrows * nwarps + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        packed[it] = get_int_b4(ptq1_block(i, kbx)->qs, min(lane, 6));
+    }
+
+#pragma unroll
+    for (int it = 0; it < niter; ++it) {
+        int i = it * nrows * nwarps + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         if (fallback) {
             i = min(i, i_max);
         }
 
-        const block_ptq1_0 * bxi = ptq1_block(i, kbx);
 #if defined(TURING_MMA_AVAILABLE)
         int * row = x_qs + i * sram_stride + kbx * (QK_PTQ1_0 / 4);
 #else
         int * row = x_qs + i * (2 * MMQ_TILE_NE_K + 1) + kbx * (QK_PTQ1_0 / 4);
 #endif // defined(TURING_MMA_AVAILABLE)
 
-        if (lane < 4) {
-            ggml_cuda_mmq_decode_ptq1_0_qs4(get_int_b4(bxi->qs, lane), row + lane, 4);
-        } else if (lane < 6) {
-            const int g = lane - 4;
-            ggml_cuda_mmq_decode_ptq1_0_qs4(get_int_b4(bxi->qs + 16, g), row + 20 + g, 2);
+        if (lane < 6) {
+            ggml_cuda_mmq_decode_ptq1_0_qs4(packed[it], row + (lane < 4 ? lane : 16 + lane), lane < 4 ? 4 : 2);
         } else if (lane == 6) {
-            uint32_t v = (uint32_t) bxi->qh[0] | ((uint32_t) bxi->qh[1] << 16);
+            uint32_t v = __byte_perm(packed[it], 0, 0x4140); // qh[0] | qh[1] << 16
 #pragma unroll
             for (int t = 0; t < 4; t += 2) {
                 const uint32_t w0 = v * 3;

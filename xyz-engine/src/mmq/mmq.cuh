@@ -93,20 +93,31 @@ static __device__ __forceinline__ void load_tiles_ptq1_0(const char * __restrict
                          : (const block_ptq1_0 *) x + kbx0 + i*stride + kb;
     };
 
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nrows * NWARPS) {
-        int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+    // Every lane's global load for every row is issued before any decode. With the loads inside the per-lane branches
+    // (lane < 4 / < 6 / == 6) each row paid load -> decode -> store as its own latency chain, I/(nrows*NWARPS) rows x
+    // 3 paths in series per warp (SASS: 8 x (LDG STS | LDG STSx5 | LDG STSx5) per 256-value step). One aligned word per
+    // lane and row instead -- lanes 0-5 the six qs words, lanes 6-7 bytes 24-27 (qh[0], qh[1], d; block_ptq1_0 is
+    // 4-aligned) -- decoded into exactly the words the branches wrote: qs word w lands at row + w (stride 4) for w < 4
+    // and at row + 16 + w (stride 2) for w = 4, 5. Bit-identical tiles.
+    constexpr int niter = I / (nrows * NWARPS);
+    static_assert(I % (nrows * NWARPS) == 0, "whole rows per warp pass");
+    uint32_t packed[niter];
 
-        const block_ptq1_0 * bxi = ptq1_block(i, kbx);
+#pragma unroll
+    for (int it = 0; it < niter; ++it) {
+        const int i = it * nrows * NWARPS + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        packed[it] = get_int_b4(ptq1_block(i, kbx)->qs, min(lane, 6));
+    }
+
+#pragma unroll
+    for (int it = 0; it < niter; ++it) {
+        const int i = it * nrows * NWARPS + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         int * row = x_qs + i * ss + kbx * (QK_PTQ1_0 / 4);
 
-        if (lane < 4) {
-            decode_ptq1_0_qs4(get_int_b4(bxi->qs, lane), row + lane, 4);
-        } else if (lane < 6) {
-            const int g = lane - 4;
-            decode_ptq1_0_qs4(get_int_b4(bxi->qs + 16, g), row + 20 + g, 2);
+        if (lane < 6) {
+            decode_ptq1_0_qs4(packed[it], row + (lane < 4 ? lane : 16 + lane), lane < 4 ? 4 : 2);
         } else if (lane == 6) {
-            uint32_t v = (uint32_t) bxi->qh[0] | ((uint32_t) bxi->qh[1] << 16);
+            uint32_t v = __byte_perm(packed[it], 0, 0x4140); // qh[0] | qh[1] << 16
 #pragma unroll
             for (int t = 0; t < 4; t += 2) {
                 const uint32_t w0 = v * 3;
