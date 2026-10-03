@@ -889,6 +889,18 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+// PTQ1_0 at J = 128 on full row tiles (every Bonsai weight has a multiple of 128 rows) runs mul_mat_q_process_tile's
+// cp.async pipeline on Ampere and Ada (Blackwell keeps the plain loop: not measured there). The host side,
+// ggml_cuda_mmq_ptq1_0_pipelined_host, adds the pipeline's shared memory for every kernel that may take it.
+template <ggml_type type, int J, bool fallback>
+static constexpr __device__ bool ggml_cuda_mmq_ptq1_0_pipelined() {
+#if defined(CP_ASYNC_AVAILABLE) && defined(TURING_MMA_AVAILABLE) && !defined(BLACKWELL_MMA_AVAILABLE) && !defined(GGML_USE_HIP)
+    return type == GGML_TYPE_PTQ1_0 && J == 128 && !fallback;
+#else
+    return false;
+#endif
+}
+
 template <ggml_type type, int J, bool fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
@@ -923,6 +935,74 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+#if !defined(GGML_USE_HIP)
+    if constexpr (ggml_cuda_mmq_ptq1_0_pipelined<type, J, fallback>()) {
+        // The next K step's weight tile goes to a raw staging buffer (ggml_cuda_mmq_ptq1_0_raw_copy) by cp.async while
+        // both halves of the current step's dot products run; the step after's activations land while its weight tile
+        // is decoded from the staging buffer. No step waits on global memory, 2 barriers per step instead of 4 (measured
+        // first on an RTX 3080 Ti; Ada, 17408 x 5120 at 512 columns: 753 -> 654 us). The second activation half gets its own
+        // buffer (tile_y1); tile_y1 and the staging buffer sit after tile_x, the shared memory launch_mul_mat_q adds
+        // for this kernel. The same bytes decoded into the same slots, the same MMAs in the same order: bit-identical.
+        static_assert(blocks_per_iter == 2, "two 128-value blocks per K step");
+        constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+        constexpr int ny          = J * MMQ_TILE_Y_K;
+        int  * tile_y1 = tile_x + I * sram_stride;
+        char * raw     = (char *) (tile_y1 + GGML_PAD(ny, nwarps * warp_size));
+
+        const auto y_half = [&](const int kb0, const int h) -> const int * {
+            return y + ncols_y * ((kb0 * qk / ne_block) * sz + h * sz);
+        };
+        const auto copy_y = [&](int * dst_y, const int * src_y) {
+            constexpr int ncopy = ny / 4; // 16-byte copies: J blocks of 144 B, contiguous
+            static_assert(ny % 4 == 0, "whole 16-byte copies");
+#pragma unroll
+            for (int c0 = 0; c0 < ncopy; c0 += nwarps * warp_size) {
+                const int c = c0 + threadIdx.y * warp_size + threadIdx.x;
+                if (ncopy % (nwarps * warp_size) == 0 || c < ncopy) {
+                    ggml_cuda_mmq_cp_async_16(dst_y + 4 * c, src_y + 4 * c);
+                }
+            }
+        };
+
+        // Every thread commits the same groups in the same order. A thread's wait covers only its own copies and the
+        // copies cross threads: the barrier after each wait makes every thread's bytes visible.
+        ggml_cuda_mmq_ptq1_0_raw_copy<type, J, fallback>(x, raw, offset_x + kb0_start, stride_row_x);
+        ggml_cuda_mmq_cp_async_commit();
+        copy_y(tile_y,  y_half(kb0_start, 0));
+        copy_y(tile_y1, y_half(kb0_start, 1));
+        ggml_cuda_mmq_cp_async_commit();
+        ggml_cuda_mmq_cp_async_wait_group<1>(); // the weights
+        __syncthreads();
+        ggml_cuda_mmq_load_tiles_ptq1_0_raw<type, J, fallback>(raw, tile_x);
+        ggml_cuda_mmq_cp_async_wait_group<0>(); // the activations
+        __syncthreads();
+
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            const bool next = kb0 + blocks_per_iter < kb0_stop;
+
+            if (next) { // the staging buffer is free: this step's decode finished before the last barrier
+                ggml_cuda_mmq_ptq1_0_raw_copy<type, J, fallback>(x, raw, offset_x + kb0 + blocks_per_iter, stride_row_x);
+            }
+            ggml_cuda_mmq_cp_async_commit();
+
+            vec_dot(tile_x, tile_y,  sum, 0);
+            vec_dot(tile_x, tile_y1, sum, MMQ_TILE_NE_K);
+
+            ggml_cuda_mmq_cp_async_wait_group<0>(); // the next weights
+            __syncthreads();                        // and every warp is done with tile_x, tile_y, tile_y1
+
+            if (next) {
+                copy_y(tile_y,  y_half(kb0 + blocks_per_iter, 0));
+                copy_y(tile_y1, y_half(kb0 + blocks_per_iter, 1));
+                ggml_cuda_mmq_cp_async_commit();
+                ggml_cuda_mmq_load_tiles_ptq1_0_raw<type, J, fallback>(raw, tile_x); // while the activations fly
+                ggml_cuda_mmq_cp_async_wait_group<0>();
+                __syncthreads();
+            }
+        }
+    } else
+#endif // !defined(GGML_USE_HIP)
+    {
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         if constexpr (type == GGML_TYPE_PTQ1_0) {
             // PTQ1_0: the activation tile's loads go out BEFORE the weight tile's decode. Issued after it (below), they
@@ -975,6 +1055,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
+    }
     }
 
     if (fixup) {
@@ -1428,6 +1509,18 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// the host side of ggml_cuda_mmq_ptq1_0_pipelined, without the fallback condition: the launch sets one shared-memory
+// size for both kernels of a J, so the full-row kernel's extra goes to the fallback kernel too (unused there)
+static bool ggml_cuda_mmq_ptq1_0_pipelined_host(const ggml_type type, const int J, const int cc) {
+    return type == GGML_TYPE_PTQ1_0 && J == 128 && cp_async_available(cc) && !blackwell_mma_available(cc);
+}
+
+// the pipeline's extra shared memory after tile_x: the second activation half and the weight staging buffer
+static size_t mmq_get_nbytes_shared_ptq1_0_pipeline(const ggml_cuda_mmq_config & config) {
+    return GGML_PAD(config.J*sizeof(block_q8_1_mmq), config.nthreads*sizeof(int)) +
+           config.K_vram/QK_PTQ1_0 * config.I * sizeof(block_ptq1_0);
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1438,7 +1531,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     GGML_ASSERT(config.nthreads % warp_size == 0);
     const int nwarps = config.nthreads / warp_size;
-    const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
+    const int nbytes_shared = (int) (mmq_get_nbytes_shared(config, cc) +
+        (ggml_cuda_mmq_ptq1_0_pipelined_host(type, J, cc) ? mmq_get_nbytes_shared_ptq1_0_pipeline(config) : 0));
 
     const dim3 block_dims(warp_size, nwarps, 1);
 

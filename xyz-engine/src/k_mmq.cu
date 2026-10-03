@@ -16,14 +16,21 @@ namespace eng {
 namespace {
 
 int     g_nsm        = 0;
+bool    g_pipe       = false;     // the device has cp.async (Ampere+): PTQ1_0 J = 128 runs the pipeline (mq::pipelined)
 float * g_fixup      = nullptr;   // one block's I x J partial tile per block of a one-per-SM grid
 char *  g_q8         = nullptr;
 size_t  g_q8_bytes   = 0;
 
+// the kernel's dynamic shared memory: the pipeline's extra wherever the device code may take it (a device without
+// cp.async runs code built without it; an Ampere+ device may run older PTX, where the extra goes unused)
+template <ggml_type type, int J>
+int smem_bytes() {
+    return mq::nbytes_shared<type>(J) + (g_pipe && mq::pipelined(type, J) ? mq::nbytes_shared_pipeline(J) : 0);
+}
+
 template <ggml_type type, int J>
 void set_smem() {
-    CUDA_CHECK(cudaFuncSetAttribute(mq::k_mmq<type, J>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    mq::nbytes_shared<type>(J)));
+    CUDA_CHECK(cudaFuncSetAttribute(mq::k_mmq<type, J>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<type, J>()));
 }
 
 template <ggml_type type>
@@ -53,7 +60,7 @@ void launch(cudaStream_t st, const void * w, const int * y, const int64_t K, con
     const uint3 blocks_per_ne00_fd = init_fastdiv_values((uint64_t) (K / QK));
     const uint3 ntx_fd             = init_fastdiv_values((uint64_t) ntx);
     const dim3 block_dims(WARP_SIZE, mq::NWARPS, 1);
-    mq::k_mmq<type, J><<<dim3(nblocks, 1, 1), block_dims, mq::nbytes_shared<type>(J), st>>>(
+    mq::k_mmq<type, J><<<dim3(nblocks, 1, 1), block_dims, smem_bytes<type, J>(), st>>>(
         (const char *) w, y, dst, g_fixup, blocks_per_ne00_fd, (int) nrows, (int) ncols, (int) (K / QK), (int) ncols,
         (int) dst_stride, ntx_fd);
     if (!fixup_needed) {
@@ -103,6 +110,9 @@ void switch_J(cudaStream_t st, const void * w, const int * y, const int64_t K, c
 void mmq_reserve(int64_t max_cols, int64_t max_K) {
     if (g_nsm == 0) {
         CUDA_CHECK(cudaDeviceGetAttribute(&g_nsm, cudaDevAttrMultiProcessorCount, 0));
+        int cc_major = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, 0));
+        g_pipe = cc_major >= 8;
         CUDA_CHECK(cudaMalloc(&g_fixup, (size_t) g_nsm*mq::I*128*sizeof(float)));
         set_smem_all<GGML_TYPE_PTQ1_0>();
         set_smem_all<GGML_TYPE_Q3_K>();

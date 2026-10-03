@@ -346,6 +346,160 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
 #endif // defined(TURING_MMA_AVAILABLE)
     }
 }
+
+// The PTQ1_0 pipeline (mul_mat_q_process_tile, ggml_cuda_mmq_ptq1_0_pipelined): the next K step's weight tile goes to a
+// raw staging buffer in shared memory by cp.async while the current step's MMAs run, and is decoded from there. ILV16
+// keeps a 16-row group's blocks of one k-block contiguous (16 x 28 = 448 B, 16-byte aligned), so a tile is
+// I/16 x blocks_per_iter runs of 28 16-byte copies; the scales ride along in the blocks.
+// Staging order [16-row group][k-block][row][28 B]: the decode's two k-blocks of a row are 448 B (16 banks) apart, so its
+// reads are conflict-free, and a group's two k-blocks are one contiguous 896 B run in global memory. (k-block outermost
+// put them I/16 x 448 B apart, a multiple of 128 B: every decode read a 2-way bank conflict.)
+// (cp-async.cuh has these helpers but no include guard, and fattn-mma-f16.cuh includes it.)
+static __device__ __forceinline__ void ggml_cuda_mmq_cp_async_16(void * dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    const unsigned int dst_s = (unsigned int) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" : : "r"(dst_s), "l"(src) : "memory");
+#else
+    GGML_UNUSED_VARS(dst, src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+static __device__ __forceinline__ void ggml_cuda_mmq_cp_async_commit() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;" : : : "memory");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// waits until at most n of this thread's most recently committed groups are still in flight
+template <int n>
+static __device__ __forceinline__ void ggml_cuda_mmq_cp_async_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" : : "n"(n) : "memory");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+static __device__ __forceinline__ int ggml_cuda_mmq_ptq1_0_raw_offset(const int kb, const int i, const int blocks_per_iter) {
+    return ((i >> 4) * blocks_per_iter + kb) * (16 * (int) sizeof(block_ptq1_0)) + (i & 15) * (int) sizeof(block_ptq1_0);
+}
+
+// the next K step's weight tile (kbx0 as ggml_cuda_mmq_load_tiles_ptq1_0 takes it) into the staging buffer, by cp.async
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_ptq1_0_raw_copy(const char * __restrict__ x, char * __restrict__ raw,
+                                                                     const int kbx0, const int stride) {
+#if defined(CP_ASYNC_AVAILABLE)
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads        = ggml_cuda_mmq_get_nthreads(type, J, fallback);
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int blocks_per_iter = ggml_cuda_mmq_get_K_vram(type, J, fallback) / QK_PTQ1_0;
+    constexpr int chunk           = 16 * (int) sizeof(block_ptq1_0); // 448 B: one k-block of one 16-row group
+    constexpr int per_chunk       = chunk / 16;                       // 28 copies
+    constexpr int ncopy           = (I / 16) * blocks_per_iter * per_chunk;
+    static_assert(I % 16 == 0 && chunk % 16 == 0, "whole ILV16 groups in 16-byte copies");
+    static_assert(!fallback, "full row tiles only: every row is in a whole 16-row ILV group");
+
+    const int kb0   = kbx0 % stride;
+    const int rbase = kbx0 - kb0;
+    const int tid   = threadIdx.y * warp_size + threadIdx.x;
+
+#pragma unroll
+    for (int c0 = 0; c0 < ncopy; c0 += nthreads) {
+        const int c = c0 + tid;
+        if (ncopy % nthreads == 0 || c < ncopy) {
+            const int p    = c / per_chunk; // g * blocks_per_iter + kb
+            const int g    = p / blocks_per_iter;
+            const int kb   = p % blocks_per_iter;
+            const int part = c % per_chunk;
+            const block_ptq1_0 * src = (const block_ptq1_0 *) x + rbase + g * 16 * stride + min(kb0 + kb, stride - 1) * 16;
+            ggml_cuda_mmq_cp_async_16(raw + p * chunk + part * 16, (const char *) src + part * 16);
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, raw, kbx0, stride);
+    NO_DEVICE_CODE;
+#endif // defined(CP_ASYNC_AVAILABLE)
+}
+
+// ggml_cuda_mmq_load_tiles_ptq1_0's decode, reading the staging buffer instead of global memory: the same words in the
+// same slots
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0_raw(const char * __restrict__ raw, int * __restrict__ x_tile) {
+#if defined(TURING_MMA_AVAILABLE)
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int *   x_qs = (int *) x_tile;
+    float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
+
+    constexpr int blocks_per_iter   = ggml_cuda_mmq_get_K_vram(type, J, fallback) / QK_PTQ1_0;
+    constexpr int threads_per_block = 8;
+    constexpr int threads_per_row   = blocks_per_iter * threads_per_block;
+    constexpr int nrows             = warp_size / threads_per_row;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / threads_per_block;
+    const int lane = txi % threads_per_block;
+
+    constexpr int scale_entries_per_block = QK_PTQ1_0 / QK8_1;
+    constexpr int scale_entries_per_row   = blocks_per_iter * scale_entries_per_block;
+    constexpr int rows_per_warp           = warp_size / scale_entries_per_row;
+    const int     ksx                     = threadIdx.x % scale_entries_per_row;
+    const int     scale_block             = ksx / scale_entries_per_block;
+
+    constexpr int niter = I / (nrows * nwarps);
+    static_assert(I % (nrows * nwarps) == 0, "whole rows per warp pass");
+    uint32_t packed[niter];
+#pragma unroll
+    for (int it = 0; it < niter; ++it) {
+        const int i = it * nrows * nwarps + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        packed[it] = *(const uint32_t *) (raw + ggml_cuda_mmq_ptq1_0_raw_offset(kbx, i, blocks_per_iter) + 4 * min(lane, 6));
+    }
+
+    const auto pw = [](const int t) -> uint32_t { return (uint32_t) (0x0000F3511B090301ull >> (8 * t)) & 0xFF; };
+    const int      gbase = threadIdx.x & ~(threads_per_block - 1);
+    const uint32_t m0    = pw(lane >> 2);
+    const uint32_t m1    = pw(2 + (lane >> 2));
+    const uint32_t m2    = lane < 4 ? pw(4) : pw((lane - 4) >> 1);
+    const uint32_t m3a   = lane < 6 ? pw((lane + 4) >> 1) : pw(2 * (lane - 6));
+    const uint32_t m3b   = lane < 6 ? m3a                 : pw(2 * (lane - 6) + 1);
+
+#pragma unroll
+    for (int it = 0; it < niter; ++it) {
+        const int i = it * nrows * nwarps + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        int * row = x_qs + i * sram_stride + kbx * (QK_PTQ1_0 / 4);
+
+        const uint32_t wa  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + (lane & 3), warp_size);
+        const uint32_t wb  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + 4 + (lane & 1), warp_size);
+        const uint32_t wq  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + 6, warp_size);
+        const uint32_t alo = __byte_perm(wa, 0, 0x4140);
+        const uint32_t ahi = __byte_perm(wa, 0, 0x4342);
+        const uint32_t blo = __byte_perm(wb, 0, 0x4140);
+        const uint32_t bhi = __byte_perm(wb, 0, 0x4342);
+        const uint32_t q   = __byte_perm(wq, 0, 0x4140); // qh[0] | qh[1] << 16
+
+        row[lane]      = ggml_cuda_mmq_ptq1_0_trit_word(alo, ahi, m0, m0);
+        row[lane + 8]  = ggml_cuda_mmq_ptq1_0_trit_word(alo, ahi, m1, m1);
+        row[lane + 16] = ggml_cuda_mmq_ptq1_0_trit_word(lane < 4 ? alo : blo, lane < 4 ? ahi : bhi, m2, m2);
+        row[lane + 24] = ggml_cuda_mmq_ptq1_0_trit_word(lane < 6 ? blo : q, lane < 6 ? bhi : q, m3a, m3b);
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        const int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / scale_entries_per_row;
+        x_df[i * sram_stride + ksx] = *(const ggml_half *) (raw + ggml_cuda_mmq_ptq1_0_raw_offset(scale_block, i, blocks_per_iter) +
+                                                             offsetof(block_ptq1_0, d));
+    }
+#else
+    GGML_UNUSED_VARS(raw, x_tile);
+    NO_DEVICE_CODE;
+#endif // defined(TURING_MMA_AVAILABLE)
+}
 #endif // !defined(GGML_USE_HIP)
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(

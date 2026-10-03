@@ -49,6 +49,14 @@ constexpr __host__ __device__ int rows_per_warp(const int J) {
 template <ggml_type type> constexpr __host__ __device__ int nbytes_shared(const int J) {
     return J*(int) sizeof(int) + I*sram_stride<type>()*4 + GGML_PAD(J*(int) sizeof(block_q8_1_mmq), NTHREADS*(int) sizeof(int));
 }
+// PTQ1_0 at J = 128 runs process_tile's cp.async pipeline where the device has cp.async (Ampere+, as ggml-cuda's
+// ggml_cuda_mmq_ptq1_0_pipelined); its extra shared memory after tile_x: the second activation half + the weight staging
+constexpr __host__ __device__ bool pipelined(const ggml_type type, const int J) {
+    return type == GGML_TYPE_PTQ1_0 && J == 128;
+}
+constexpr __host__ __device__ int nbytes_shared_pipeline(const int J) {
+    return GGML_PAD(J*(int) sizeof(block_q8_1_mmq), NTHREADS*(int) sizeof(int)) + ITER_K/QK_PTQ1_0 * I * (int) sizeof(block_ptq1_0);
+}
 
 // ---- the x tiles --------------------------------------------------------------------------------------------------
 
@@ -153,6 +161,130 @@ static __device__ __forceinline__ void load_tiles_ptq1_0(const char * __restrict
     for (int i0 = 0; i0 < I; i0 += NWARPS * rows_per_warp_sc) {
         int i = i0 + threadIdx.y * rows_per_warp_sc + threadIdx.x / scale_entries_per_row;
         x_df[i * ss + ksx] = dsc[i0 / (NWARPS * rows_per_warp_sc)];
+    }
+}
+
+// The pipeline's weight path (ggml-cuda mmq-load-tiles.cuh ggml_cuda_mmq_ptq1_0_raw_copy / _load_tiles_ptq1_0_raw): the
+// next K step's I rows x 2 blocks go to a staging buffer by cp.async, [16-row group][k-block][row][28 B] (a group's two
+// k-blocks are one contiguous 896 B run in global memory, and the decode's two k-blocks of a row land 16 banks apart),
+// then decode from there into exactly the slots load_tiles_ptq1_0 writes.
+static __device__ __forceinline__ void cp_async_16(void * dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" : : "r"((unsigned int) __cvta_generic_to_shared(dst)), "l"(src) : "memory");
+#else
+    GGML_UNUSED_VARS(dst, src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+static __device__ __forceinline__ void cp_async_commit() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;" : : : "memory");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+// waits until at most n of this thread's most recently committed groups are still in flight
+template <int n> static __device__ __forceinline__ void cp_async_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" : : "n"(n) : "memory");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+static __device__ __forceinline__ int ptq1_raw_offset(const int kb, const int i) {
+    constexpr int blocks_per_iter = ITER_K / QK_PTQ1_0;
+    return ((i >> 4) * blocks_per_iter + kb) * (16 * (int) sizeof(block_ptq1_0)) + (i & 15) * (int) sizeof(block_ptq1_0);
+}
+
+static __device__ __forceinline__ void ptq1_raw_copy(const char * __restrict__ x, char * __restrict__ raw, const int kbx0,
+                                                     const int stride) {
+    constexpr int blocks_per_iter = ITER_K / QK_PTQ1_0;
+    constexpr int chunk           = 16 * (int) sizeof(block_ptq1_0); // 448 B: one k-block of one 16-row group
+    constexpr int per_chunk       = chunk / 16;                       // 28 copies
+    constexpr int ncopy           = (I / 16) * blocks_per_iter * per_chunk;
+
+    const int kb0   = kbx0 % stride;
+    const int rbase = kbx0 - kb0;
+    const int tid   = threadIdx.y * WARP_SIZE + threadIdx.x;
+
+#pragma unroll
+    for (int c0 = 0; c0 < ncopy; c0 += NTHREADS) {
+        const int c = c0 + tid;
+        if (ncopy % NTHREADS == 0 || c < ncopy) {
+            const int p    = c / per_chunk; // g * blocks_per_iter + kb
+            const int g    = p / blocks_per_iter;
+            const int kb   = p % blocks_per_iter;
+            const int part = c % per_chunk;
+            const block_ptq1_0 * src = (const block_ptq1_0 *) x + rbase + g * 16 * stride + min(kb0 + kb, stride - 1) * 16;
+            cp_async_16(raw + p * chunk + part * 16, (const char *) src + part * 16);
+        }
+    }
+}
+
+static __device__ __forceinline__ void load_tiles_ptq1_0_raw(const char * __restrict__ raw, int * __restrict__ x_tile) {
+    constexpr int ss = sram_stride<GGML_TYPE_PTQ1_0>();
+
+    int *   x_qs = (int *) x_tile;
+    float * x_df = (float *) (x_qs + 2 * TILE_NE_K);
+
+    constexpr int blocks_per_iter   = ITER_K / QK_PTQ1_0;
+    constexpr int threads_per_block = 8;
+    constexpr int threads_per_row   = blocks_per_iter * threads_per_block;
+    constexpr int nrows             = WARP_SIZE / threads_per_row;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / threads_per_block;
+    const int lane = txi % threads_per_block;
+
+    constexpr int scale_entries_per_block = QK_PTQ1_0 / QK8_1;
+    constexpr int scale_entries_per_row   = blocks_per_iter * scale_entries_per_block;
+    constexpr int rows_per_warp_sc        = WARP_SIZE / scale_entries_per_row;
+    const int     ksx                     = threadIdx.x % scale_entries_per_row;
+    const int     scale_block             = ksx / scale_entries_per_block;
+
+    constexpr int niter = I / (nrows * NWARPS);
+    static_assert(I % (nrows * NWARPS) == 0, "whole rows per warp pass");
+    uint32_t packed[niter];
+#pragma unroll
+    for (int it = 0; it < niter; ++it) {
+        const int i = it * nrows * NWARPS + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        packed[it] = *(const uint32_t *) (raw + ptq1_raw_offset(kbx, i) + 4 * min(lane, 6));
+    }
+
+    static_assert(threads_per_block == 8, "an 8-lane group per block");
+    const auto pw = [](const int t) -> uint32_t { return (uint32_t) (0x0000F3511B090301ull >> (8 * t)) & 0xFF; };  // 3^t
+    const int      gbase = threadIdx.x & ~(threads_per_block - 1);
+    const uint32_t m0    = pw(lane >> 2);
+    const uint32_t m1    = pw(2 + (lane >> 2));
+    const uint32_t m2    = lane < 4 ? pw(4) : pw((lane - 4) >> 1);
+    const uint32_t m3a   = lane < 6 ? pw((lane + 4) >> 1) : pw(2 * (lane - 6));
+    const uint32_t m3b   = lane < 6 ? m3a                 : pw(2 * (lane - 6) + 1);
+
+#pragma unroll
+    for (int it = 0; it < niter; ++it) {
+        const int i = it * nrows * NWARPS + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        int * row = x_qs + i * ss + kbx * (QK_PTQ1_0 / 4);
+
+        const uint32_t wa  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + (lane & 3), WARP_SIZE);
+        const uint32_t wb  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + 4 + (lane & 1), WARP_SIZE);
+        const uint32_t wq  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + 6, WARP_SIZE);
+        const uint32_t alo = __byte_perm(wa, 0, 0x4140);
+        const uint32_t ahi = __byte_perm(wa, 0, 0x4342);
+        const uint32_t blo = __byte_perm(wb, 0, 0x4140);
+        const uint32_t bhi = __byte_perm(wb, 0, 0x4342);
+        const uint32_t q   = __byte_perm(wq, 0, 0x4140); // qh[0] | qh[1] << 16
+
+        row[lane]      = trit_word(alo, ahi, m0, m0);
+        row[lane + 8]  = trit_word(alo, ahi, m1, m1);
+        row[lane + 16] = trit_word(lane < 4 ? alo : blo, lane < 4 ? ahi : bhi, m2, m2);
+        row[lane + 24] = trit_word(lane < 6 ? blo : q, lane < 6 ? bhi : q, m3a, m3b);
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += NWARPS * rows_per_warp_sc) {
+        const int i = i0 + threadIdx.y * rows_per_warp_sc + threadIdx.x / scale_entries_per_row;
+        x_df[i * ss + ksx] = *(const ggml_half *) (raw + ptq1_raw_offset(scale_block, i) + offsetof(block_ptq1_0, d));
     }
 }
 
@@ -427,6 +559,71 @@ static __device__ __forceinline__ void process_tile(const char * __restrict__ x,
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+#ifdef CP_ASYNC_AVAILABLE
+    if constexpr (pipelined(type, J)) {
+        // ggml-cuda mul_mat_q_process_tile's PTQ1_0 pipeline: the next K step's weight tile comes in by cp.async while
+        // both halves of the current step's dot products run, the step after's activations while its weight tile is
+        // decoded from the staging buffer -- no step waits on global memory, 2 barriers per step. tile_y1 and the
+        // staging buffer sit after tile_x (nbytes_shared_pipeline). Same slots, same MMAs in the same order.
+        static_assert(blocks_per_iter == 2, "two 128-value blocks per K step");
+        constexpr int ny = J * TILE_Y_K;
+        int  * tile_y1 = tile_x + I * sram_stride<type>();
+        char * raw     = (char *) (tile_y1 + GGML_PAD(ny, NWARPS * WARP_SIZE));
+
+        const auto y_half = [&](const int kb0, const int h) -> const int * {
+            return y + ncols_y * ((kb0 * QK / ne_block) * sz + h * sz);
+        };
+        const auto copy_y = [&](int * dst_y, const int * src_y) {
+            constexpr int ncopy = ny / 4; // 16-byte copies: J blocks of 144 B, contiguous
+            static_assert(ny % 4 == 0, "whole 16-byte copies");
+#pragma unroll
+            for (int c0 = 0; c0 < ncopy; c0 += NWARPS * WARP_SIZE) {
+                const int c = c0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+                if (ncopy % (NWARPS * WARP_SIZE) == 0 || c < ncopy) {
+                    cp_async_16(dst_y + 4 * c, src_y + 4 * c);
+                }
+            }
+        };
+
+        // every thread commits the same groups in the same order; a thread's wait covers only its own copies and the
+        // copies cross threads, so the barrier after each wait is what makes every thread's bytes visible
+        ptq1_raw_copy(x, raw, offset_x + kb0_start, stride_row_x);
+        cp_async_commit();
+        copy_y(tile_y,  y_half(kb0_start, 0));
+        copy_y(tile_y1, y_half(kb0_start, 1));
+        cp_async_commit();
+        cp_async_wait_group<1>(); // the weights
+        __syncthreads();
+        load_tiles_ptq1_0_raw(raw, tile_x);
+        cp_async_wait_group<0>(); // the activations
+        __syncthreads();
+
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            const bool next = kb0 + blocks_per_iter < kb0_stop;
+
+            if (next) { // the staging buffer is free: this step's decode finished before the last barrier
+                ptq1_raw_copy(x, raw, offset_x + kb0 + blocks_per_iter, stride_row_x);
+            }
+            cp_async_commit();
+
+            vec_dot_q8_0_q8_1<J>(tile_x, tile_y,  sum, 0);
+            vec_dot_q8_0_q8_1<J>(tile_x, tile_y1, sum, TILE_NE_K);
+
+            cp_async_wait_group<0>(); // the next weights
+            __syncthreads();          // and every warp is done with tile_x, tile_y, tile_y1
+
+            if (next) {
+                copy_y(tile_y,  y_half(kb0 + blocks_per_iter, 0));
+                copy_y(tile_y1, y_half(kb0 + blocks_per_iter, 1));
+                cp_async_commit();
+                load_tiles_ptq1_0_raw(raw, tile_x); // while the activations fly
+                cp_async_wait_group<0>();
+                __syncthreads();
+            }
+        }
+    } else
+#endif // CP_ASYNC_AVAILABLE
+    {
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         if constexpr (type == GGML_TYPE_PTQ1_0) {
             // the activation tile's loads go out BEFORE the weight tile's decode (as ggml-cuda mul_mat_q_process_tile):
@@ -483,6 +680,7 @@ static __device__ __forceinline__ void process_tile(const char * __restrict__ x,
         }
 
         __syncthreads();
+    }
     }
 
     if (fixup) {
