@@ -60,6 +60,77 @@ static __device__ __forceinline__ void load_act(Act & a, const ActPtr & p, const
     memcpy(a.dsb, &zb, sizeof(zb));
 }
 
+// ---- the weight decode, matched to the record layout (ptq1_rec.cuh) ----------------------------------------------------
+// The uniform tail. The fork's decode (mmvq-ptq1-mma.cuh ptq1_decode_row) gives the tail (elements 80..127: qs[16..23] and
+// the qh pair) to the lanes unevenly -- lanes 0/1 trits 0, 2, 4 of one word, lanes 2/3 trits 1, 3 and the qh trits,
+// picked with selects. Here lane c decodes its OWN tail bytes 16+2c, 17+2c (all five trits, as the halves of one pair)
+// and two trits of qh[c & 1], with no selects: the lane only changes which byte pair and which multiplier (set once per
+// kernel). The record writer puts each activation at the position its weight now has (ptq1_rec_kk); a slice's int32 sum
+// is exact in any order, so every output is bit-identical (200 -> 179 instructions per k-block, sm_89 SASS).
+struct UtLane {
+    uint32_t sel_t;   // the tail word's half: bytes 16+2c, 17+2c as a pair
+    uint32_t sel_h;   // qh[c & 1] alone in byte 0
+    uint32_t mh;      // 0x30001 * 3^t (t = 2(c >> 1)): h * mh = (h 3^t, h 3^(t+1)) as the halves of a pair
+};
+
+static __device__ __forceinline__ UtLane ut_lane(const int c) {
+    UtLane u;
+    u.sel_t = (c & 1) ? 0x4342u : 0x4140u;
+    u.sel_h = (c & 1) ? 0x4441u : 0x4440u;
+    u.mh    = (c & 2) ? 0x30001u*9u : 0x30001u;
+    return u;
+}
+
+// lane c's words of a block: qs[4c..4c+3], the tail word holding bytes 16+2c, 17+2c, and qh[0] qh[1] d
+static __device__ __forceinline__ ptq1_words load_words(const block_ptq1_0 * __restrict__ b, const int c) {
+    ptq1_words r;
+    r.q  = (uint32_t) get_int_b4(b->qs, c);
+    r.t  = (uint32_t) get_int_b4(b->qs + 16, c >> 1);
+    r.hd = (uint32_t) get_int_b4(b, 6);
+    return r;
+}
+
+// Row r's 8 A registers. Slices 0-2a as the fork's (the five trits of qs word c, Q_t - 3 Q_{t-1}); the tail from the pair
+// tl = (byte 16+2c, byte 17+2c) and the qh byte h: p_t = tl * 3^t holds Q_{t-1} of both bytes in bytes 1 and 3, and
+// hy = h * mh = (h 3^t, h 3^(t+1)) holds Q_{t-1}, Q_t of h in bytes 1 and 3, hy * 3 Q_t, Q_{t+1} (all < 2^16 per half:
+// no carries).
+template <bool digits>
+static __device__ __forceinline__ void decode_row(const uint32_t q, const uint32_t t, const uint32_t hd, const UtLane & u,
+                                                  const int r, ptq1_frag & f) {
+    uint32_t ql, qhi;
+    ptq1_walk_init(q, ql, qhi);
+    const uint32_t Q0 = ptq1_q_at(ql, qhi, 3);
+    const uint32_t Q1 = ptq1_q_at(ql, qhi, 9);
+    const uint32_t Q2 = ptq1_q_at(ql, qhi, 27);
+    const uint32_t Q3 = ptq1_q_at(ql, qhi, 81);
+    const uint32_t Q4 = ptq1_q_at(ql, qhi, 243);
+    const uint32_t tl = __byte_perm(t, 0, u.sel_t);
+    const uint32_t p1 = tl*3u;
+    const uint32_t p2 = tl*9u;
+    const uint32_t p3 = tl*27u;
+    const uint32_t p4 = tl*81u;
+    const uint32_t p5 = tl*243u;
+    const uint32_t hy = __byte_perm(hd, 0, u.sel_h)*u.mh;
+    f.s[0][0 + r] = ptq1_a4<digits>(Q0);                    // k  0..15: trit 0
+    f.s[0][2 + r] = ptq1_a4<digits>(ptq1_q_trit(Q1, Q0));   // k 16..31: trit 1
+    f.s[1][0 + r] = ptq1_a4<digits>(ptq1_q_trit(Q2, Q1));
+    f.s[1][2 + r] = ptq1_a4<digits>(ptq1_q_trit(Q3, Q2));
+    f.s[2][0 + r] = ptq1_a4<digits>(ptq1_q_trit(Q4, Q3));   // k 64..79
+    // (Q0, Q1 of the pair) - 3 (0, Q0): its trits 0, 1
+    f.s[2][2 + r] = ptq1_a4<digits>(ptq1_q_trit(__byte_perm(p1, p2, 0x7531), __byte_perm(p1, 0, 0x3144)));
+    // (Q2, Q3) - 3 (Q1, Q2): trits 2, 3
+    f.s[3][0 + r] = ptq1_a4<digits>(ptq1_q_trit(__byte_perm(p3, p4, 0x7531), __byte_perm(p2, p3, 0x7531)));
+    // (Q4 of the pair, Q_t Q_{t+1} of h) - 3 (Q3, Q_{t-1} Q_t): trit 4 of the pair, trits t, t+1 of h
+    f.s[3][2 + r] = ptq1_a4<digits>(ptq1_q_trit(__byte_perm(p5, hy*3u, 0x7531), __byte_perm(p4, hy, 0x7531)));
+}
+
+template <bool digits>
+static __device__ __forceinline__ void decode_words(const ptq1_words & wa, const ptq1_words & wb, const UtLane & u,
+                                                    ptq1_frag & f) {
+    decode_row<digits>(wa.q, wa.t, wa.hd, u, 0, f);
+    decode_row<digits>(wb.q, wb.t, wb.hd, u, 1, f);
+}
+
 // one k-block's contribution: blk[l] = sum over its 4 slices of d8 * IMMA (the tile's inner loop, ntiles 1)
 template <bool isum>
 static __device__ __forceinline__ void block_mma(const ptq1_frag & fx, const Act & a, float (&blk)[4]) {
@@ -94,6 +165,48 @@ static __device__ __forceinline__ void block_mma(const ptq1_frag & fx, const Act
         blk[1] += d8_1 * (float) C.x[1];
         blk[2] += d8_0 * (float) C.x[2];
         blk[3] += d8_1 * (float) C.x[3];
+    }
+}
+
+// k_ptq1_own's k-block loop: U blocks per iteration (kb = kb0 + u*nwarps); KSTEP blocks between a row's k-blocks (16 in
+// an ILV16 tile, 1 row-major); ROWB_AT_8: row g+8 is xa + 8 (an ILV16 tile), else its own pointer xb
+template <bool isum, int U, int KSTEP, bool ROWB_AT_8>
+static __device__ __forceinline__ void own_loop(const block_ptq1_0 * __restrict__ xa, const block_ptq1_0 * __restrict__ xb,
+                                                const ActPtr & ap, const UtLane & ul, const int c, const int w,
+                                                const int nblocks, float (&acc)[4]) {
+    constexpr int nwarps = 4;
+    for (int kb0 = w; kb0 < nblocks; kb0 += U*nwarps) {
+        ptq1_words wa[U], wb[U];
+        Act        act[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int kb = kb0 + u*nwarps;
+            if (kb < nblocks) {
+                wa[u] = load_words(xa + kb*KSTEP, c);
+                wb[u] = load_words((ROWB_AT_8 ? xa + 8 : xb) + kb*KSTEP, c);
+                load_act(act[u], ap, kb);
+            }
+        }
+        float blk[U][4];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (kb0 + u*nwarps < nblocks) {
+                ptq1_frag fx;
+                decode_words<isum>(wa[u], wb[u], ul, fx);
+                block_mma<isum>(fx, act[u], blk[u]);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {   // in k-block order: acc += d * blk
+            if (kb0 + u*nwarps < nblocks) {
+                const float da = ptq1_word_scale(wa[u].hd);
+                const float db = ptq1_word_scale(wb[u].hd);
+                acc[0] += da * blk[u][0];
+                acc[1] += da * blk[u][1];
+                acc[2] += db * blk[u][2];
+                acc[3] += db * blk[u][3];
+            }
+        }
     }
 }
 
@@ -153,41 +266,16 @@ static __global__ void k_ptq1_own(const void * __restrict__ vx, const void * __r
     const block_q8_1 *   y  = (const block_q8_1 *) vy;
     const ActPtr         ap = act_ptr(y, stride_col_y, 0, g, c, ncols);
 
+    const UtLane ul = ut_lane(c);
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    // U blocks per iteration: kb = kb0 + u*nwarps
-    for (int kb0 = w; kb0 < nblocks; kb0 += U*nwarps) {
-        ptq1_words wa[U], wb[U];
-        Act        act[U];
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int kb = kb0 + u*nwarps;
-            if (kb < nblocks) {
-                wa[u] = ptq1_load_words(xa + kb*kstep, c);
-                wb[u] = ptq1_load_words(xb + kb*kstep, c);
-                load_act(act[u], ap, kb);
-            }
-        }
-        float blk[U][4];
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-            if (kb0 + u*nwarps < nblocks) {
-                ptq1_frag fx;
-                ptq1_decode_words<isum>(wa[u], wb[u], c, fx);
-                block_mma<isum>(fx, act[u], blk[u]);
-            }
-        }
-#pragma unroll
-        for (int u = 0; u < U; ++u) {   // in k-block order: acc += d * blk
-            if (kb0 + u*nwarps < nblocks) {
-                const float da = ptq1_word_scale(wa[u].hd);
-                const float db = ptq1_word_scale(wb[u].hd);
-                acc[0] += da * blk[u][0];
-                acc[1] += da * blk[u][1];
-                acc[2] += db * blk[u][2];
-                acc[3] += db * blk[u][3];
-            }
-        }
+    // A whole ILV16 tile (every tile but a ragged last one) has row g+8's block 8 blocks after row g's: its loads are row
+    // g's at a constant offset, no address math of their own. The same loads, decodes and sums in the same order.
+    if (tile_ilv) {
+        own_loop<isum, U, 16, true>(xa, xa, ap, ul, c, w, nblocks, acc);
+    } else {
+        own_loop<isum, U, 1, false>(xa, xb, ap, ul, c, w, nblocks, acc);
     }
+    GGML_UNUSED(kstep);
 
     // warps 1..3 hand their partial sums to warp 0, which adds them in warp order
     __shared__ float red[nwarps - 1][4][WARP_SIZE];
@@ -357,17 +445,18 @@ static __global__ void k_ptq1_own_nt(const void * __restrict__ vx, const void * 
         ap[nt] = act_ptr(y, stride_col_y, nt*8, g, c, ncols);
     }
 
+    const UtLane ul = ut_lane(c);
     float acc[NT][4] = {{0.0f}};
     for (int kb = w; kb < nblocks; kb += nwarps) {
-        const ptq1_words wa = ptq1_load_words(xa + kb*kstep, c);
-        const ptq1_words wb = ptq1_load_words(xb + kb*kstep, c);
+        const ptq1_words wa = load_words(xa + kb*kstep, c);
+        const ptq1_words wb = load_words(xb + kb*kstep, c);
         Act act[NT];
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             load_act(act[nt], ap[nt], kb);
         }
         ptq1_frag fx;
-        ptq1_decode_words<isum>(wa, wb, c, fx);
+        decode_words<isum>(wa, wb, ul, fx);
         float blk[NT][4];
         block_mma_nt<isum, NT>(fx, act, blk);
         const float da = ptq1_word_scale(wa.hd);

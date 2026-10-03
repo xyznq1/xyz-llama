@@ -6,6 +6,7 @@
 // register carries a pair -- and every kernel here runs them h = 1, 2, ..., N/2, the order the fork's kernels use, so the
 // engine's rotations are the fork's bits (tools/had_test.cu).
 #include "common.cuh"
+#include "ptq1_rec.cuh"
 
 namespace eng {
 
@@ -91,7 +92,7 @@ __device__ __forceinline__ void q8_twin_store(char * __restrict__ vy, const int6
     const int64_t iqs = i % QK8_1;
     char * rec = vy + (ib / 4) * (4 * (int64_t) sizeof(block_q8_1));
     const int s = ib % 4;
-    rec[((iqs % 16)/4*8 + 2*s + iqs/16)*4 + iqs % 4] = q;
+    rec[ptq1_rec_pos(s, (int) iqs)] = q;   // ptq1_rec.cuh
     const int sum_q = warp_reduce_sum<QK8_1>((int) q);
     if (iqs == 0) {
         ((half2 *) (rec + 4*QK8_1))[s] = ptq1_perm_ds(d, sum, sum_q);
