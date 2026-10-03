@@ -951,6 +951,12 @@ private:
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
+    // the target's state rolls back only to context checkpoints (the do_checkpoint condition of the prompt loop)
+    bool target_needs_checkpoints() const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS_REPLAY || n_swa > 0;
+    }
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1429,6 +1435,11 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // a target that rolls back only to context checkpoints: cached states rank by what survives the rollback
+            prompt_cache->needs_checkpoints = target_needs_checkpoints();
+            SRV_INF("prompt cache: %s\n", prompt_cache->needs_checkpoints ?
+                    "candidates rank by what survives the rollback to a checkpoint" : "plain prefixes");
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1669,11 +1680,20 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                // what the slot keeps is what survives the rollback (measured on an RTX 3080 Ti, 2026-10-03): a prompt
+                // that does not extend the slot's restarts at the newest context checkpoint at or below the match, or at
+                // 0. Judged by the raw match, a prompt sharing most of the slot's tokens with no checkpoint under them
+                // "kept" them, the cache holding the request's own conversation was never asked, and all of it was
+                // re-read (a switch back to a 32k conversation: 24.8 s -> 0.4 s).
+                const size_t n_slot = ret->prompt.tokens.size();
+                const size_t kept   = ret->prompt.tokens.get_common_prefix(task.tokens);
+                const size_t usable = server_prompt_cache::usable_prefix(kept, n_slot,
+                        server_prompt_cache::ckpt_positions(ret->prompt.checkpoints), target_needs_checkpoints());
+                const float f_keep = n_slot > 0 ? float(usable) / n_slot : 0.0f;
 
                 if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            f_sim_best, slot_prompt_similarity, f_keep);
+                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f (match %zu, usable %zu of %zu)\n",
+                            f_sim_best, slot_prompt_similarity, f_keep, kept, usable, n_slot);
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache

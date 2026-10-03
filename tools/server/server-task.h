@@ -628,11 +628,39 @@ struct server_prompt_cache {
         llama_tokens tokens;
         std::string  path;
         size_t       bytes = 0;
+        std::vector<int64_t> ckpt_n; // n_tokens of the state's context checkpoints (where a rollback can resume)
     };
     std::list<disk_entry> disk;
     std::string disk_dir;
     size_t      disk_limit = 0;
     size_t      disk_bytes = 0;
+
+    // A hybrid/recurrent (or SWA) target cannot roll its state back to an arbitrary position. A cached prompt that the
+    // new one does not simply extend is only reusable up to its newest context checkpoint at or below the match (the
+    // restore resets to 0 otherwise), so candidates rank by that, not by the raw prefix. Measured on an RTX 3080 Ti,
+    // 2026-10-03: a 44k conversation was re-read in full (60 s) because a 16k prompt sharing 15.9k tokens with it, with
+    // no checkpoint under 15.9k, "kept" 96% and the cache, which held the conversation, was never asked.
+    bool needs_checkpoints = false;
+    static size_t usable_prefix(size_t kept, size_t n_cached, const std::vector<int64_t> & ckpt_n, bool needs_checkpoints) {
+        if (!needs_checkpoints || kept >= n_cached) {
+            return kept;   // nothing to roll back: the state is kept as is
+        }
+        size_t best = 0;
+        for (const int64_t n : ckpt_n) {
+            if (n > 0 && (size_t) n <= kept && (size_t) n > best) {
+                best = (size_t) n;
+            }
+        }
+        return best;
+    }
+    static std::vector<int64_t> ckpt_positions(const std::list<common_prompt_checkpoint> & checkpoints) {
+        std::vector<int64_t> res;
+        res.reserve(checkpoints.size());
+        for (const auto & c : checkpoints) {
+            res.push_back(c.n_tokens);
+        }
+        return res;
+    }
 
     void disk_init();
     bool disk_spill(const server_prompt_cache_state & state);

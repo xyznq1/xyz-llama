@@ -1742,6 +1742,31 @@ bool pc_read_head(FILE * f, llama_tokens & tokens) {  // magic, version, tokens:
     tokens.resize((size_t) n);
     return pc_read(f, tokens.data(), (size_t) n * sizeof(llama_token));
 }
+bool pc_skip_vec(FILE * f) {
+    uint64_t n = 0;
+#ifdef _WIN32
+    return pc_get(f, n) && n <= PC_DISK_MAX_VEC && _fseeki64(f, (int64_t) n, SEEK_CUR) == 0;
+#else
+    return pc_get(f, n) && n <= PC_DISK_MAX_VEC && fseeko(f, (off_t) n, SEEK_CUR) == 0;
+#endif
+}
+// after the head: the checkpoint count and each checkpoint's n_tokens (its data blobs skipped)
+bool pc_read_ckpt_n(FILE * f, std::vector<int64_t> & ckpt_n) {
+    uint32_t n_ckpt = 0;
+    if (!pc_get(f, n_ckpt) || n_ckpt >= 4096) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_ckpt; ++i) {
+        int64_t n_tok = 0;
+        int32_t id = -1, pmin = 0, pmax = 0;
+        if (!pc_get(f, n_tok) || !pc_get(f, id) || !pc_get(f, pmin) || !pc_get(f, pmax) ||
+            !pc_skip_vec(f) || !pc_skip_vec(f) || !pc_skip_vec(f)) {
+            return false;
+        }
+        ckpt_n.push_back(n_tok);
+    }
+    return true;
+}
 } // namespace
 
 void server_prompt_cache::disk_init() {
@@ -1770,6 +1795,9 @@ void server_prompt_cache::disk_init() {
         FILE * f = fopen(fp.second.string().c_str(), "rb");
         disk_entry de;
         const bool ok = f != nullptr && pc_read_head(f, de.tokens);
+        if (ok && !pc_read_ckpt_n(f, de.ckpt_n)) {
+            de.ckpt_n.clear();   // unknown checkpoints: the entry still matches as a plain prefix of new prompts
+        }
         if (f) {
             fclose(f);
         }
@@ -1858,6 +1886,7 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
     de.tokens = tokens;
     de.path   = path;
     de.bytes  = (size_t) std::filesystem::file_size(path, ec);
+    de.ckpt_n = ckpt_positions(state.prompt.checkpoints);
     disk_bytes += de.bytes;
     disk.push_back(std::move(de));
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1868,7 +1897,22 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
 }
 
 void server_prompt_cache::evict_front() {
-    disk_spill(states.front());
+    // a state already on the SSD as these exact tokens: dropping it from RAM loses nothing, and rewriting it costs a
+    // synchronous ~1.5 s (2 GiB) on the request that made room
+    const auto & front = states.front();
+    bool held = false;
+    if (!disk_dir.empty() && !front.prompt.tokens.has_mtmd) {
+        const llama_tokens tokens = front.prompt.tokens.get_text_tokens();
+        for (const auto & de : disk) {
+            if (de.tokens.size() == tokens.size() && pc_common_prefix(de.tokens, tokens) == tokens.size()) {
+                held = true;
+                break;
+            }
+        }
+    }
+    if (!held) {
+        disk_spill(front);
+    }
     states.pop_front();
 }
 
@@ -1997,10 +2041,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    // what survives the rollback: a prompt the new one does not extend is reusable up to its newest checkpoint at or
+    // below the match (needs_checkpoints), so a long shared prefix without a checkpoint under it is worth nothing
+    const auto usable = [&](const server_tokens & cached, const std::list<common_prompt_checkpoint> & checkpoints) {
+        return usable_prefix(cached.get_common_prefix(tokens_new), cached.size(), ckpt_positions(checkpoints),
+                             needs_checkpoints);
+    };
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    const size_t base = usable(prompt.tokens, prompt.checkpoints);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(base) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_sim_best  = float(base) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -2008,12 +2059,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const size_t m = usable(it->prompt.tokens, it->prompt.checkpoints);
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+        const float f_keep_cur = float(m) / it->prompt.tokens.size();
+        const float f_sim_cur  = float(m) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, usable lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), m, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -2033,9 +2084,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (!disk.empty() && !tokens_new.has_mtmd && tokens_new.size() > 0) {
         const llama_tokens tnew = tokens_new.get_text_tokens();
         for (auto it = disk.begin(); it != disk.end(); ++it) {
-            const size_t lcp_cur    = pc_common_prefix(it->tokens, tnew);
-            const float  f_keep_cur = it->tokens.empty() ? 0.0f : float(lcp_cur) / it->tokens.size();
-            const float  f_sim_cur  = float(lcp_cur) / tokens_new.size();
+            const size_t keep_n     = usable_prefix(pc_common_prefix(it->tokens, tnew), it->tokens.size(), it->ckpt_n,
+                                                    needs_checkpoints);
+            const float  f_keep_cur = it->tokens.empty() ? 0.0f : float(keep_n) / it->tokens.size();
+            const float  f_sim_cur  = float(keep_n) / tokens_new.size();
 
             if (f_keep_cur < 0.25f) {
                 continue;
