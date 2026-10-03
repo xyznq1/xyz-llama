@@ -12,7 +12,8 @@ checks every token the drafter guesses, so you get the exact same text the model
 
 We measured it on an RTX 4070 Ti SUPER (16 GB, stock power limit) at around 161k context, temperature 1.0, top-k 20,
 top-p 0.95, over 10 generations (11,964 tokens): 149.5 tokens/s and 2.82 tokens per round. With `XYZ_ENGINE=1` it's
-151.2 tokens/s, same text. Over 30 questions it's 2.92 tokens per round. It reads a 161k prompt at 921 tokens/s.
+151.2 tokens/s, same text. Over 30 questions it's 2.92 tokens per round. It reads a 161k prompt at 929 tokens/s, 984
+with `XYZ_ENGINE=1`.
 
 ## What's in it
 
@@ -112,7 +113,7 @@ defaults, if you want something different just edit that command.
 | System | Windows 11, 32 GB RAM |
 | Driver | 610.88, CUDA 13.3 |
 | Speed at around 161k context | 149.5 tokens/s, 151.2 with `XYZ_ENGINE=1` |
-| Reading a 161k prompt | 921 tokens/s (v1.2: about 780) |
+| Reading a 161k prompt | 929 tokens/s, 984 with `XYZ_ENGINE=1` (v1.2: about 780) |
 
 ## Notes
 
