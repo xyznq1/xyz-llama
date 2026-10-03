@@ -1,5 +1,1 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Questions, ideas and your own numbers
-    url: https://github.com/xyznq1/xyz-llama/discussions
-    about: How to run it, what speed you get on your card, what you'd like next.
+blank_issues_enabled: true
