@@ -52,19 +52,12 @@ template <ggml_type type> constexpr __host__ __device__ int nbytes_shared(const 
 
 // ---- the x tiles --------------------------------------------------------------------------------------------------
 
-// mmq-load-tiles.cuh ggml_cuda_mmq_decode_ptq1_0_qs4: 4 bytes of 5 trits -> 5 ints of 4 signed values at dst[t*stride]
-static __device__ __forceinline__ void decode_ptq1_0_qs4(uint32_t packed, int * __restrict__ dst, int stride) {
-    uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
-    uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
-
-#pragma unroll
-    for (int t = 0; t < 5; ++t) {
-        const uint32_t w_lo = v_lo * 3;
-        const uint32_t w_hi = v_hi * 3;
-        v_lo                = w_lo & 0x00FF00FF;
-        v_hi                = w_hi & 0x00FF00FF;
-        dst[t * stride]     = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
-    }
+// mmq-load-tiles.cuh ggml_cuda_mmq_ptq1_0_trit_word: one decoded word -- the trits of byte pairs va, vb (16-bit lanes)
+// at stages ta, tb (ma = 3^ta, mb = 3^tb), minus 1, as signed bytes; + 0x7F007F00 and ^ 0x80808080 do the - 1
+static __device__ __forceinline__ uint32_t trit_word(const uint32_t va, const uint32_t vb, const uint32_t ma, const uint32_t mb) {
+    const uint32_t wa = ((va * ma) & 0x00FF00FF) * 3 + 0x7F007F00;
+    const uint32_t wb = ((vb * mb) & 0x00FF00FF) * 3 + 0x7F007F00;
+    return __byte_perm(wa, wb, 0x7531) ^ 0x80808080;
 }
 
 // ggml_cuda_mmq_load_tiles_ptq1_0 (the int8 MMA layout, ILV16): the trits of I rows x 2 blocks as signed bytes, then
@@ -99,6 +92,21 @@ static __device__ __forceinline__ void load_tiles_ptq1_0(const char * __restrict
     // lane and row instead -- lanes 0-5 the six qs words, lanes 6-7 bytes 24-27 (qh[0], qh[1], d; block_ptq1_0 is
     // 4-aligned) -- decoded into exactly the words the branches wrote: qs word w lands at row + w (stride 4) for w < 4
     // and at row + 16 + w (stride 2) for w = 4, 5. Bit-identical tiles.
+    // the blocks' scales are loaded here too, with the trits, and stored after the decode (their loop used to follow
+    // the decode, so its loads waited for it)
+    constexpr int scale_entries_per_block = QK_PTQ1_0 / QK8_1;
+    constexpr int scale_entries_per_row   = blocks_per_iter * scale_entries_per_block;
+    constexpr int rows_per_warp_sc        = WARP_SIZE / scale_entries_per_row;
+    const int     ksx                     = threadIdx.x % scale_entries_per_row;
+    const int     scale_block             = ksx / scale_entries_per_block;
+    constexpr int nsc = (I + NWARPS * rows_per_warp_sc - 1) / (NWARPS * rows_per_warp_sc);
+    ggml_half dsc[nsc];
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += NWARPS * rows_per_warp_sc) {
+        const int i = i0 + threadIdx.y * rows_per_warp_sc + threadIdx.x / scale_entries_per_row;
+        dsc[i0 / (NWARPS * rows_per_warp_sc)] = ptq1_block(i, scale_block)->d;
+    }
+
     constexpr int niter = I / (nrows * NWARPS);
     static_assert(I % (nrows * NWARPS) == 0, "whole rows per warp pass");
     uint32_t packed[niter];
@@ -109,38 +117,42 @@ static __device__ __forceinline__ void load_tiles_ptq1_0(const char * __restrict
         packed[it] = get_int_b4(ptq1_block(i, kbx)->qs, min(lane, 6));
     }
 
+    // one code path for all eight lanes of a block (as ggml-cuda's loader): lane l writes words l, l+8, l+16 and l+24 of
+    // the block's 32 -- qs word w%4 at stage w/4 for w < 20, qs word 4 + w%2 at stage (w-20)/2 for w < 30, the qh pair at
+    // stages 2(w-30), 2(w-30)+1 for w = 30, 31 -- trading the loaded words with shuffles (trit_word: any stage directly)
+    static_assert(threads_per_block == 8, "an 8-lane group per block");
+    const auto pw = [](const int t) -> uint32_t { return (uint32_t) (0x0000F3511B090301ull >> (8 * t)) & 0xFF; };  // 3^t
+    const int      gbase = threadIdx.x & ~(threads_per_block - 1);
+    const uint32_t m0    = pw(lane >> 2);
+    const uint32_t m1    = pw(2 + (lane >> 2));
+    const uint32_t m2    = lane < 4 ? pw(4) : pw((lane - 4) >> 1);
+    const uint32_t m3a   = lane < 6 ? pw((lane + 4) >> 1) : pw(2 * (lane - 6));
+    const uint32_t m3b   = lane < 6 ? m3a                 : pw(2 * (lane - 6) + 1);
+
 #pragma unroll
     for (int it = 0; it < niter; ++it) {
         const int i = it * nrows * NWARPS + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         int * row = x_qs + i * ss + kbx * (QK_PTQ1_0 / 4);
 
-        if (lane < 6) {
-            decode_ptq1_0_qs4(packed[it], row + (lane < 4 ? lane : 16 + lane), lane < 4 ? 4 : 2);
-        } else if (lane == 6) {
-            uint32_t v = __byte_perm(packed[it], 0, 0x4140); // qh[0] | qh[1] << 16
-#pragma unroll
-            for (int t = 0; t < 4; t += 2) {
-                const uint32_t w0 = v * 3;
-                v                 = w0 & 0x00FF00FF;
-                const uint32_t w1 = v * 3;
-                v                 = w1 & 0x00FF00FF;
-                row[30 + t / 2]   = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
-            }
-        }
-    }
+        const uint32_t wa  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + (lane & 3), WARP_SIZE);
+        const uint32_t wb  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + 4 + (lane & 1), WARP_SIZE);
+        const uint32_t wq  = __shfl_sync(0xFFFFFFFF, packed[it], gbase + 6, WARP_SIZE);
+        const uint32_t alo = __byte_perm(wa, 0, 0x4140);
+        const uint32_t ahi = __byte_perm(wa, 0, 0x4342);
+        const uint32_t blo = __byte_perm(wb, 0, 0x4140);
+        const uint32_t bhi = __byte_perm(wb, 0, 0x4342);
+        const uint32_t q   = __byte_perm(wq, 0, 0x4140); // qh[0] | qh[1] << 16
 
-    constexpr int scale_entries_per_block = QK_PTQ1_0 / QK8_1;
-    constexpr int scale_entries_per_row   = blocks_per_iter * scale_entries_per_block;
-    constexpr int rows_per_warp_sc        = WARP_SIZE / scale_entries_per_row;
-    const int     ksx                     = threadIdx.x % scale_entries_per_row;
-    const int     scale_block             = ksx / scale_entries_per_block;
+        row[lane]      = trit_word(alo, ahi, m0, m0);
+        row[lane + 8]  = trit_word(alo, ahi, m1, m1);
+        row[lane + 16] = trit_word(lane < 4 ? alo : blo, lane < 4 ? ahi : bhi, m2, m2);
+        row[lane + 24] = trit_word(lane < 6 ? blo : q, lane < 6 ? bhi : q, m3a, m3b);
+    }
 
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += NWARPS * rows_per_warp_sc) {
         int i = i0 + threadIdx.y * rows_per_warp_sc + threadIdx.x / scale_entries_per_row;
-
-        const block_ptq1_0 * bxi = ptq1_block(i, scale_block);
-        x_df[i * ss + ksx] = bxi->d;
+        x_df[i * ss + ksx] = dsc[i0 / (NWARPS * rows_per_warp_sc)];
     }
 }
 
@@ -210,7 +222,8 @@ static __device__ __forceinline__ void load_tiles_q3_K(const char * __restrict__
 
 // ---- the dot products ---------------------------------------------------------------------------------------------
 
-// ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<.., MMQ_Q8_1_DS_LAYOUT_D4> (the Turing MMA branch): PTQ1_0
+// ggml_cuda_mmq_vec_dot_ptq1_mma (the Turing MMA branch): PTQ1_0. One call is one 128-value block, whose weight scale
+// the loader writes to all four 32-wide slots, so it is read once per call: the same products in the same order.
 template <int J>
 static __device__ __forceinline__ void vec_dot_q8_0_q8_1(const int * __restrict__ x, const int * __restrict__ y,
                                                          float * __restrict__ sum, const int k00) {
@@ -230,7 +243,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1(const int * __restrict_
     const float * y_df = (const float *) y;
 
     tile_A A[ntx][TILE_NE_K/QI8_0];
-    float dA[ntx][tile_C::ne/2][TILE_NE_K/QI8_0];
+    float dA[ntx][tile_C::ne/2];
 
     const int i0 = (threadIdx.y/ntx)*rpw;
 
@@ -246,13 +259,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1(const int * __restrict_
 #pragma unroll
         for (int l = 0; l < tile_C::ne/2; ++l) {
             const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
-
-#pragma unroll
-            for (int k01 = 0; k01 < TILE_NE_K; k01 += QI8_0) {
-                const int k0 = k00 + k01;
-
-                dA[n][l][k01/QI8_0] = x_df[i*ss + k0/QI8_0];
-            }
+            dA[n][l] = x_df[i*ss + k00/QI8_0];
         }
     }
 
@@ -279,7 +286,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1(const int * __restrict_
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
                 }
             }
         }
@@ -422,11 +429,22 @@ static __device__ __forceinline__ void process_tile(const char * __restrict__ x,
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         if constexpr (type == GGML_TYPE_PTQ1_0) {
+            // the activation tile's loads go out BEFORE the weight tile's decode (as ggml-cuda mul_mat_q_process_tile):
+            // issued after it they wait for its divergent branches -- two global round trips per step instead of one
+            constexpr int ny = (J * TILE_Y_K + NWARPS * WARP_SIZE - 1) / (NWARPS * WARP_SIZE);
+            const int * by0 = y + ncols_y * (kb0 * QK / ne_block) * sz;
+            int ytmp[ny];
+#pragma unroll
+            for (int l0 = 0; l0 < ny; ++l0) {
+                ytmp[l0] = by0[l0 * NWARPS * WARP_SIZE + threadIdx.y * WARP_SIZE + threadIdx.x];
+            }
             load_tiles_ptq1_0(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+#pragma unroll
+            for (int l0 = 0; l0 < ny; ++l0) {
+                tile_y[l0 * NWARPS * WARP_SIZE + threadIdx.y * WARP_SIZE + threadIdx.x] = ytmp[l0];
+            }
         } else {
             load_tiles_q3_K(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        }
-        {
             const int * by0 = y + ncols_y * (kb0 * QK / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * TILE_Y_K; l0 += NWARPS * WARP_SIZE) {

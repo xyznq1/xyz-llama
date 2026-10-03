@@ -736,7 +736,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_ptq1_0<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_vec_dot_ptq1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
 #endif // !defined(GGML_USE_HIP)
         case GGML_TYPE_Q4_0:
@@ -924,6 +924,24 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        if constexpr (type == GGML_TYPE_PTQ1_0) {
+            // PTQ1_0: the activation tile's loads go out BEFORE the weight tile's decode. Issued after it (below), they
+            // wait for its divergent branches and the step pays two global round trips instead of one (Nsight
+            // Compute). The same words land in the same slots; registers are free here, the kernel's
+            // peak is inside vec_dot.
+            constexpr int ny = (J * MMQ_TILE_Y_K + nwarps * warp_size - 1) / (nwarps * warp_size);
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            int ytmp[ny];
+#pragma unroll
+            for (int l0 = 0; l0 < ny; ++l0) {
+                ytmp[l0] = by0[l0 * nwarps * warp_size + threadIdx.y * warp_size + threadIdx.x];
+            }
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+#pragma unroll
+            for (int l0 = 0; l0 < ny; ++l0) {
+                tile_y[l0 * nwarps * warp_size + threadIdx.y * warp_size + threadIdx.x] = ytmp[l0];
+            }
+        } else {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
@@ -933,6 +951,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
                 tile_y[l] = by0[l];
             }
+        }
         }
 
         __syncthreads();
