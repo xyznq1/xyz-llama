@@ -539,9 +539,9 @@ struct common_speculative_impl_draft_xyz : public common_speculative_impl {
         b.token = nullptr;
         llama_batch_free(b);
         if (rc != 0) {
-            // keep the rows: nothing was materialized, and clearing them here would lose them for good --
-            // the next draft() emits them again, exactly as if the flush had never been attempted
-            SPC_ERR("stash flush llama_decode(ctx_dft) failed rc=%d (rows=%d), rows kept\n", rc, (int) n);
+            // clearing on error prevents bad/stale positions from permanently bricking the slot
+            SPC_ERR("stash flush llama_decode(ctx_dft) failed rc=%d (rows=%d), clearing stash\n", rc, (int) n);
+            stash_clear(seq_id);
             return;
         }
         stash_clear(seq_id);
@@ -783,6 +783,12 @@ struct common_speculative_impl_draft_xyz : public common_speculative_impl {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
+        }
+        // if stashed rows are outside the prompt range, clear them
+        if (seq_id >= 0 && seq_id < (llama_seq_id) stash_rows.size()) {
+            if (!stash_rows[seq_id].empty() && (stash_rows[seq_id][0].pos < 0 || stash_rows[seq_id][0].pos >= N)) {
+                stash_clear(seq_id);
+            }
         }
         // expected state after prefill: ctx_dft has pos 0..N-2 (last position is deferred to
         // draft()'s seed step). Warn only if more than one position is missing.
@@ -1421,15 +1427,18 @@ struct common_speculative_impl_draft_xyz : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        // the restored KV is whatever was saved; rows stashed against the pre-restore state do not belong to it
+        stash_clear(seq_id);
+
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
+            pending_pos_last[seq_id] = -1;
+            pending_g_last[seq_id].clear();
             return;
         }
 
         llama_pos pos = -1;
         std::memcpy(&pos, data.data(), sizeof(llama_pos));
-
-        // the restored KV is whatever was saved; rows stashed against the pre-restore state do not belong to it
-        stash_clear(seq_id);
 
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
